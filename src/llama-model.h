@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-expert-source.h"
 
 #include <map>
 #include <memory>
@@ -946,6 +947,9 @@ struct llama_model {
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
+
+    // Nexus: metadata inmutable para streaming MoE desde NVMe
+    llama_expert_model_meta expert_meta;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

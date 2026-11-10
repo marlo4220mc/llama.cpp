@@ -2144,6 +2144,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Nexus: extraer metadatos inmutables de los expertos MoE mientras ml está vivo
+    expert_meta.files.clear();
+    expert_meta.files.reserve(ml.files.size());
+    for (const auto & f : ml.files) {
+        expert_meta.files.push_back({ f->fname(), (uint64_t) f->size() });
+    }
+
+    expert_meta.tensors.clear();
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+            if (!t) continue;
+            auto it = ml.weights_map.find(ggml_get_name(t));
+            if (it != ml.weights_map.end()) {
+                llama_expert_tensor_meta t_meta;
+                t_meta.shard_idx     = (int32_t) it->second.idx;
+                t_meta.base_offset   = (uint64_t) it->second.offs;
+                t_meta.expert_stride = (uint64_t) t->nb[2];
+                t_meta.expert_bytes  = (uint64_t) t->nb[2];
+                t_meta.n_expert      = (int32_t) t->ne[2];
+
+                const bool is_moe        = (t->ne[2] > 1);
+                const bool is_row_dense  = (t->nb[1] == ggml_row_size(t->type, t->ne[0]));
+                const bool is_exp_dense  = (t->nb[2] == (uint64_t) t->ne[1] * t->nb[1]);
+                const uint64_t shard_sz  = (uint64_t) ml.files[it->second.idx]->size();
+                const bool fits_in_shard = (it->second.offs + (uint64_t) t->ne[2] * t->nb[2] <= shard_sz);
+
+                t_meta.is_supported = (is_moe && is_row_dense && is_exp_dense && fits_in_shard);
+                expert_meta.tensors[t] = t_meta;
+            }
+        }
+    }
+
     load_tensors_hadamard();
 
     return true;
