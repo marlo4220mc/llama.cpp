@@ -612,6 +612,13 @@ struct common_params {
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
 
+    // Nexus: NVMe-backed MoE expert streaming (reuses --moe-cache-mib as the L1 GPU bank)
+    bool   expert_stream        = false; // --expert-stream
+    size_t expert_stream_size   = 0;     // --expert-stream-mib, staging ring in bytes, 0 = automatic
+    size_t expert_ram_size      = 1024ull*1024*1024; // --expert-ram-mib, L2 warm RAM cache in bytes, 0 = L2 disabled
+    bool   expert_stream_stats  = false; // --expert-stream-stats
+    bool   expert_stream_verify = false; // --expert-stream-verify
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

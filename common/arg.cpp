@@ -18,6 +18,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdarg>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <list>
@@ -903,6 +904,14 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    // Nexus: expert streaming reuses the MoE cache as the GPU expert bank (L1).
+    // Refuse a partial or silent activation: without it there is nothing to stream into.
+    if (!params.usage && !params.completion && params.expert_stream && params.moe_cache_size == 0) {
+        throw std::invalid_argument(
+            "error: --expert-stream requires --moe-cache-mib > 0\n"
+            "       (the MoE cache is the GPU expert bank that streamed experts are uploaded into)");
+    }
+
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
         ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||
@@ -1359,6 +1368,21 @@ static std::vector<std::string> parse_csv_row(const std::string& input) {
     fields.push_back(std::move(field));
 
     return fields;
+}
+
+// Nexus: MiB -> bytes conversion with an explicit 64-bit widening before the
+// multiply, so that the product can never overflow size_t (checked, never truncated).
+static size_t expert_mib_to_bytes(const char * opt, int value, bool allow_zero) {
+    if (value < 0 || (!allow_zero && value == 0)) {
+        throw std::invalid_argument(string_format("invalid value: %s must be %s",
+            opt, allow_zero ? "a non-negative number" : "a positive number"));
+    }
+    const uint64_t bytes = (uint64_t) value * 1024ull * 1024ull;
+    if (bytes > (uint64_t) SIZE_MAX) {
+        throw std::invalid_argument(string_format("invalid value: %s is too large: %d MiB does not fit in size_t",
+            opt, value));
+    }
+    return (size_t) bytes;
 }
 
 common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
@@ -2765,6 +2789,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_cache_cpu_share = share;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
+    add_opt(common_arg(
+        {"--expert-stream"},
+        string_format("stream the MoE experts from NVMe while keeping a warm RAM cache and a GPU expert cache "
+                      "(requires --moe-cache-mib > 0) (default: %s)",
+                      params.expert_stream ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.expert_stream = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_STREAM"));
+    add_opt(common_arg(
+        {"--expert-stream-mib"}, "N",
+        string_format("size in MiB of the staging ring used to upload streamed experts to the GPU "
+                      "(default: %zu, automatic)", params.expert_stream_size/1024/1024),
+        [](common_params & params, int value) {
+            params.expert_stream_size = expert_mib_to_bytes("--expert-stream-mib", value, false);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_STREAM_MIB"));
+    add_opt(common_arg(
+        {"--expert-ram-mib"}, "N",
+        string_format("size in MiB of the warm RAM cache that keeps recently used MoE experts in L2 "
+                      "(default: %zu, 0 = disabled)", params.expert_ram_size/1024/1024),
+        [](common_params & params, int value) {
+            params.expert_ram_size = expert_mib_to_bytes("--expert-ram-mib", value, true);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_RAM_MIB"));
+    add_opt(common_arg(
+        {"--expert-stream-stats"},
+        string_format("log expert streaming counters on shutdown (default: %s)",
+                      params.expert_stream_stats ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.expert_stream_stats = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_STREAM_STATS"));
+    add_opt(common_arg(
+        {"--expert-stream-verify"},
+        string_format("verify every streamed expert by re-reading it and comparing the bytes "
+                      "(golden path, slow) (default: %s)",
+                      params.expert_stream_verify ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.expert_stream_verify = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_STREAM_VERIFY"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
