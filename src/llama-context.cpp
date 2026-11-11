@@ -1,3 +1,4 @@
+#include "llama-expert-source.h"
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -394,6 +395,10 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size      = params.moe_cache_size;
+    cparams.expert_stream       = params.expert_stream;
+    cparams.expert_ram_size     = params.expert_ram_size;
+    cparams.expert_stream_stats = params.expert_stream_stats;
+    cparams.expert_stream_verify = params.expert_stream_verify;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
     // resolved after flash attention, see resolve_fused_ops()
@@ -612,6 +617,20 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+                if (cparams.expert_stream && !model.expert_meta.files.empty()) {
+            llama_expert_source::config es_cfg;
+            es_cfg.ram_warm_bytes = cparams.expert_ram_size > 0 ? cparams.expert_ram_size : 1024ull * 1024 * 1024;
+            es_cfg.stats          = cparams.expert_stream_stats;
+            es_cfg.verify         = cparams.expert_stream_verify;
+            expert_source = llama_expert_source::create(model.expert_meta, es_cfg);
+            if (expert_source) {
+                LLAMA_LOG_INFO("%s: Nexus expert streaming source initialized (%.2f MiB L2 arena)\n",
+                    __func__, (double)es_cfg.ram_warm_bytes / (1024.0 * 1024.0));
+            } else {
+                LLAMA_LOG_WARN("%s: failed to initialize Nexus expert source, falling back\n", __func__);
+            }
         }
 
         if (cparams.moe_cache_size > 0) {
@@ -3240,7 +3259,25 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            bool streamed = false;
+            if (lctx->expert_source) {
+                // Try streaming individual experts via Nexus L2 arena
+                bool all_ok = true;
+                for (int64_t e_idx = next; e_idx <= last; ++e_idx) {
+                    size_t slot_off = (size_t) e_idx * expert_size;
+                    auto st = lctx->expert_source->fill_expert(backend, dst, 0, src, (int32_t)e_idx, slot_off, expert_size);
+                    if (st != llama_expert_fill_status::LOADED) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                if (all_ok) {
+                    streamed = true;
+                }
+            }
+            if (!streamed) {
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            }
         }
 
         first = last + 1;
@@ -4455,6 +4492,10 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.expert_stream               =*/ false,
+        /*.expert_ram_size             =*/ 1024ull * 1024 * 1024,
+        /*.expert_stream_stats         =*/ false,
+        /*.expert_stream_verify        =*/ false,
         /*.moe_cache_cpu_share         =*/ 0.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
