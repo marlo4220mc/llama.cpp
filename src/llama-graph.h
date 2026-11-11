@@ -926,6 +926,15 @@ struct llm_graph_fused_node {
     int il;
 };
 
+// the CPU part of a MoE layer whose misses the MoE cache computes within the graph, see llama_moe_cache::set_cpu_graph
+struct llm_graph_moe_cpu_part {
+    int32_t       il;
+    ggml_tensor * input;    // [n_embd, 1, n_tokens]
+    ggml_tensor * selected; // [n_expert_used, n_tokens]
+    ggml_tensor * ids;      // [n_expert_used, n_tokens] experts of the CPU, -1 for the others
+    ggml_tensor * result;   // [n_embd, n_expert_used, n_tokens]
+};
+
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -988,6 +997,9 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<llm_graph_moe_cpu_part> moe_cpu_parts; // not in the graph, the MoE cache computes them
+    bool moe_cache_main = false; // the thread that queues the graph computes its CPU parts, see llama_moe_cache::main_ok
+    std::vector<int32_t> moe_publish; // the publish ops of the MoE cache in the graph, see llama_moe_cache::check_graph
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 

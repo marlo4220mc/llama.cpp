@@ -1434,6 +1434,8 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    moe_cpu_parts.clear();
+    moe_publish.clear();
     hdmd_inputs.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
@@ -2421,7 +2423,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const std::array<ggml_tensor *, 4> exps = { up_exps, gate_exps, down_exps, gate_up_exps };
     const bool can_cpu_share = !weight_before_ffn && loras->empty() &&
         std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; });
-    const llm_graph_moe_cache_slots cache = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, can_cpu_share, il);
+
+    // with up to 8 tokens in the ubatch the misses are computed within the graph, see llama_moe_cache::single
+    // the ubatch decides for all the layers, a graph cannot also have slot lookups, and the last layer can have fewer tokens
+    const bool single_ubatch = moe_cache != nullptr && moe_cache->single(il, this->n_tokens, can_cpu_share) &&
+        std::all_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w == nullptr || moe_cache->get_experts(w) != nullptr; });
+    const bool single = single_ubatch && n_tokens > 0;
+
+    llm_graph_moe_cache_slots cache = { nullptr, nullptr };
+    ggml_tensor * slots_miss = nullptr; // two pass: the slots of the misses that the device caches, ready once they are copied
+    if (single) {
+        // the skipped experts of a pass give zero, which biases would change
+        // TODO: [TAG_MUL_MAT_ID_SKIP] remove the one pass path once MUL_MAT_ID (all kernels and types) and ADD_ID skip negative ids
+        //       on the backends that run the MoE cache ops, then every ubatch of the single graph can compute the hits first
+        const bool two_pass = moe_cache->two_pass(il, this->n_tokens) &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
+            std::all_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w == nullptr || ggml_is_quantized(w->type); });
+        ggml_tensor * published = moe_cache->build_publish(ctx0, selected_experts, cur, il, two_pass);
+        cb(published, "ffn_moe_publish", il);
+        ggml_build_forward_expand(gf, published);
+        if (two_pass) {
+            cache.slots = ggml_view_2d(ctx0, published, published->ne[0], published->ne[1], published->nb[1], 0);
+            slots_miss  = moe_cache->build_join(ctx0, ggml_view_2d(ctx0, published, published->ne[0], published->ne[1], published->nb[1], published->nb[2]), il);
+            cb(slots_miss, "ffn_moe_join", il);
+        } else {
+            cache.slots = published;
+        }
+    } else if (single_ubatch) {
+        // no rows (the last layer computes only the outputs, if any): the cached experts are not read, and the graph has no slot lookups
+        cache.slots = selected_experts;
+    } else {
+        cache = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, can_cpu_share, il);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2595,7 +2628,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots, true);
-    if (cache.cpu_ids != nullptr) {
+    if (slots_miss != nullptr) {
+        // the hits first, so that they are computed while the misses are copied
+        ggml_build_forward_expand(gf, experts);
+        experts = ggml_add(ctx0, experts, build_experts(cur, selected_experts, slots_miss, true));
+        cb(experts, "ffn_moe_down_two_pass", il);
+    }
+    if (single && moe_cache->single_cpu_part()) {
+        // the experts of the CPU read zero slots in the hits pass and are skipped in the misses pass
+        // the CPU part is not in the graph, the MoE cache computes it while the graph runs
+        if (!moe_cache->has_cpu_graph(il, n_tokens)) {
+            ggml_tensor * input = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, n_tokens);
+            ggml_tensor * sel   = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
+            ggml_tensor * ids   = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
+            res->moe_cpu_parts.push_back({ il, input, sel, ids, build_experts(input, sel, ids, false) });
+        }
+        experts = moe_cache->build_merge(ctx0, experts, cache.slots, il);
+        cb(experts, "ffn_moe_down_merged", il);
+    } else if (cache.cpu_ids != nullptr) {
         // the cached experts and the misses computed from the host experts, each reads the others as zero
         // the cached experts come first in the graph, so that they are computed while the misses are
         ggml_build_forward_expand(gf, experts);
