@@ -1265,7 +1265,7 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(slots->type == GGML_TYPE_I32 && ggml_is_contiguous(slots));
         ggml_tensor * args[] = { slots };
         return ggml_custom_4d(ctx, GGML_TYPE_I32, slots->ne[0], slots->ne[1], slots->ne[2], slots->ne[3], args, 1,
-            sg.api->join, 1, (void *) &sg.params[il]);
+            sg.api->join, 1, const_cast<ggml_moe_cpu_layer *>(&sg.params[il]));
     }
 
     ggml_tensor * build_publish(ggml_context * ctx, ggml_tensor * selected_experts, ggml_tensor * cur, int32_t il, bool two_pass) const {
@@ -1279,7 +1279,7 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(ids->type == GGML_TYPE_I32 && cur->type == GGML_TYPE_F32 && ggml_nrows(ids) == ggml_nrows(cur));
         ggml_tensor * args[] = { ids, cur, map, sg.state };
         return ggml_custom_4d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1], two_pass ? 2 : 1, 1, args, 4,
-            sg.api->publish, 1, (void *) &sg.params[il]);
+            sg.api->publish, 1, const_cast<ggml_moe_cpu_layer *>(&sg.params[il]));
     }
 
     ggml_tensor * build_merge(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * slots, int32_t il) const {
@@ -1288,7 +1288,7 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(ggml_nelements(slots) == ggml_nrows(experts));
         ggml_tensor * args[] = { experts, slots, sg.state };
         return ggml_custom_4d(ctx, GGML_TYPE_F32, experts->ne[0], experts->ne[1], experts->ne[2], experts->ne[3], args, 3,
-            sg.api->merge, 1, (void *) &sg.params[il]);
+            sg.api->merge, 1, const_cast<ggml_moe_cpu_layer *>(&sg.params[il]));
     }
 
     bool has_cpu_graph(int32_t il, int64_t n_tokens) const {
