@@ -230,6 +230,7 @@ struct llama_expert_source::impl {
     std::condition_variable cv_idle;
     std::condition_variable cv_gate;
     std::condition_variable cv_quiescent;
+    std::condition_variable cv_loading;
 
     bool     gate_closed       = false;
     uint64_t gate_epoch        = 0;
@@ -276,8 +277,10 @@ struct llama_expert_source::impl {
     impl() = default;
 
     ~impl() {
-        drain_for_teardown();
-        stats.log("shutdown");
+        if (arena_base != nullptr) {
+            drain_for_teardown();
+            stats.log("shutdown");
+        }
 
         for (auto & s : shards) {
             if (s.fd >= 0) {
@@ -319,6 +322,55 @@ struct llama_expert_source::impl {
         }
 
         std::_Exit(EXIT_FAILURE);
+    }
+
+
+    void init_backend_memory(ggml_backend_t backend) {
+        if (!backend || arena_buf != nullptr) {
+            return;
+        }
+#if defined(GGML_USE_VULKAN)
+        if (ggml_backend_is_vk(backend)) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            if (dev) {
+                ggml_backend_buffer_type_t expected_buft = ggml_backend_dev_host_buffer_type(dev);
+                if (expected_buft != nullptr && expected_buft == ggml_backend_vk_host_buffer_type()) {
+                    ggml_backend_buffer_t vk_buf = ggml_backend_buft_alloc_buffer(expected_buft, arena_bytes);
+                    if (vk_buf != nullptr) {
+                        ggml_backend_buffer_type_t effective_buft = ggml_backend_buffer_get_type(vk_buf);
+                        void * new_base = ggml_backend_buffer_get_base(vk_buf);
+                        if (effective_buft == expected_buft && new_base != nullptr) {
+                            // Escenario 1: PINNED_VK exitoso
+                            if (owns_arena && arena_base) {
+                                free(arena_base);
+                            }
+                            arena_buf   = vk_buf;
+                            arena_base  = new_base;
+                            owns_arena  = false;
+                            mem_kind    = llama_expert_mem_kind::PINNED_VK;
+                            LLAMA_LOG_INFO("nexus-expert-stream: upgraded to PINNED_VK host buffer (%zu bytes)\n", arena_bytes);
+                            return;
+                        } else if (effective_buft == ggml_backend_cpu_buffer_type() && new_base != nullptr) {
+                            // Escenario 2: PAGEABLE_HOST_FALLBACK devuelto por Vulkan
+                            if (owns_arena && arena_base) {
+                                free(arena_base);
+                            }
+                            arena_buf   = vk_buf;
+                            arena_base  = new_base;
+                            owns_arena  = false;
+                            mem_kind    = llama_expert_mem_kind::PAGEABLE_HOST_FALLBACK;
+                            LLAMA_LOG_WARN("nexus-expert-stream: Vulkan returned CPU fallback buffer (PAGEABLE_HOST_FALLBACK)\n");
+                            return;
+                        } else {
+                            // Buffer devuelto no soportado / desconocido -> rechazar y liberar
+                            LLAMA_LOG_ERROR("nexus-expert-stream: unsupported buffer type returned by Vulkan, rejecting\n");
+                            ggml_backend_buffer_free(vk_buf);
+                        }
+                    }
+                }
+            }
+        }
+#endif
     }
 
     // Allocator First-Fit
@@ -414,7 +466,10 @@ struct llama_expert_source::impl {
             return l2_inflight.empty();
         }
         if (effective_sync_mode == sync_mode::CPU_SYNC) {
-            return l2_inflight.empty();
+            if (bound_backend) {
+                ggml_backend_synchronize(bound_backend);
+            }
+            return true;
         }
         if (effective_sync_mode == sync_mode::CALLBACK_SYNC) {
             try {
@@ -746,12 +801,19 @@ llama_expert_fill_status llama_expert_source::fill_expert(
         ++p.programming_fills;
         guard.arm();
 
+        // B3: Comprobación estricta de backend
+        if (p.bound_backend != nullptr && backend != nullptr && p.bound_backend != backend) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: backend mismatch: operation requested on a different backend\n");
+            return llama_expert_fill_status::IO_ERROR;
+        }
+
         // Enlazar backend y clasificar modo en el primer fill
         if (!p.bound_backend && backend) {
             p.bound_backend = backend;
 #if defined(GGML_USE_VULKAN)
             if (ggml_backend_is_vk(backend)) {
                 p.effective_sync_mode = impl::sync_mode::CALLBACK_SYNC;
+                p.init_backend_memory(backend);
             } else
 #endif
             {
@@ -774,24 +836,43 @@ llama_expert_fill_status llama_expert_source::fill_expert(
     p.stats.fills++;
     llama_expert_key key { il, reinterpret_cast<uintptr_t>(w), expert };
 
-    // --- 1. Consulta L2 Cache ---
+    // --- 1. Consulta L2 Cache & Coordinación LOADING (B2) ---
     bool is_hit = false;
     size_t blk_offset = 0;
     {
-        std::lock_guard<std::mutex> lk(p.l2_mutex);
-        auto it = p.l2_index.find(key);
-        if (it != p.l2_index.end() && it->second.content == llama_expert_content::RESIDENT) {
-            is_hit = true;
-            p.stats.l2_hits++;
-            nexus_l2_block & blk = it->second;
-            blk.pin_layers++;
-            blk.lru_tick = ++p.current_lru_tick;
-            blk_offset = blk.offset;
+        std::unique_lock<std::mutex> lk(p.l2_mutex);
+        while (true) {
+            auto it = p.l2_index.find(key);
+            if (it != p.l2_index.end()) {
+                if (it->second.content == llama_expert_content::RESIDENT) {
+                    is_hit = true;
+                    p.stats.l2_hits++;
+                    nexus_l2_block & blk = it->second;
+                    blk.pin_layers++;
+                    blk.lru_tick = ++p.current_lru_tick;
+                    blk_offset = blk.offset;
 
-            p.l2_lru_list.erase(blk.lru_it);
-            p.l2_lru_list.push_front(key);
-            blk.lru_it = p.l2_lru_list.begin();
+                    p.l2_lru_list.erase(blk.lru_it);
+                    p.l2_lru_list.push_front(key);
+                    blk.lru_it = p.l2_lru_list.begin();
+                    break;
+                } else if (it->second.content == llama_expert_content::LOADING) {
+                    // B2: Otro hilo está cargando esta clave. Esperar en cv_loading.
+                    p.cv_loading.wait(lk);
+                    if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+                        return llama_expert_fill_status::IO_ERROR;
+                    }
+                    continue; // Re-evaluar estado tras el despertar
+                } else {
+                    // INVALID o estado anómalo
+                    return llama_expert_fill_status::IO_ERROR;
+                }
+            } else {
+                // Clave ausente en L2 -> requiere carga
+                break;
+            }
         }
+
     }
 
     // --- 2. Miss: Asignación y carga NVMe ---
@@ -854,6 +935,7 @@ llama_expert_fill_status llama_expert_source::fill_expert(
                 p.l2_lru_list.erase(it->second.lru_it);
                 p.l2_index.erase(it);
             }
+            p.cv_loading.notify_all(); // B2: Despertar cualquier hilo que esperaba
             return llama_expert_fill_status::IO_ERROR;
         }
 
@@ -872,6 +954,7 @@ llama_expert_fill_status llama_expert_source::fill_expert(
             if (it != p.l2_index.end()) {
                 it->second.content = llama_expert_content::RESIDENT;
             }
+            p.cv_loading.notify_all(); // B2: Notificar a hilos esperando por esta clave
         }
     }
 
@@ -915,9 +998,16 @@ llama_expert_fill_status llama_expert_source::fill_expert(
 
         auto it = p.l2_index.find(key);
         if (it != p.l2_index.end()) {
+            uint64_t next_epoch = p.fill_epoch + 1;
+            try {
+                p.l2_inflight.push_back({ key, next_epoch });
+            } catch (...) {
+                // Si la asignación de memoria para l2_inflight falla, no alterar contadores
+                return llama_expert_fill_status::OUT_OF_MEMORY;
+            }
+            p.fill_epoch = next_epoch;
             it->second.inflight++;
-            it->second.last_fill_epoch = ++p.fill_epoch;
-            p.l2_inflight.push_back({ key, p.fill_epoch });
+            it->second.last_fill_epoch = next_epoch;
         }
 
         lk.unlock();

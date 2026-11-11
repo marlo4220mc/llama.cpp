@@ -270,12 +270,94 @@ static void test_concurrency_and_barrier_quiescence() {
     printf("[PASS] Concurrent fills and barrier quiescence passed all invariant tests.\n");
 }
 
+
+static void test_b1_b4_robustness_invariants() {
+    printf("[TEST] Testing Bloques B1-B4 robustness invariants...\n");
+
+    llama_expert_model_meta meta;
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 10 * 1024 * 1024;
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_b1b4_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t fake_file_size = 10 * 1024 * 1024;
+    ftruncate(fd, fake_file_size);
+    meta.files.push_back({ temp_path, fake_file_size });
+
+    ggml_tensor t_m1{};
+    t_m1.ne[2] = 5; t_m1.nb[2] = 1000000;
+    meta.tensors[&t_m1] = { 0, 0, 1000000, 1000000, 5, true };
+
+    auto exsrc = llama_expert_source::create(meta, cfg);
+    TEST_CHECK(exsrc != nullptr, "Create failed");
+
+    // 1. Test B3: Backend Mismatch
+    ggml_backend_t cpu_b1 = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t cpu_b2 = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    TEST_CHECK(cpu_b1 != nullptr && cpu_b2 != nullptr, "Failed to initialize CPU backends");
+
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(ggml_backend_get_device(cpu_b1));
+    const size_t bank_total_bytes = 5000000;
+    ggml_backend_buffer_t bank_buf = ggml_backend_buft_alloc_buffer(cpu_buft, bank_total_bytes);
+    TEST_CHECK(bank_buf != nullptr, "Failed to alloc bank buffer");
+
+    ggml_tensor dummy_bank{};
+    dummy_bank.type = GGML_TYPE_I8;
+    dummy_bank.ne[0] = bank_total_bytes;
+    dummy_bank.ne[1] = 1;
+    dummy_bank.ne[2] = 1;
+    dummy_bank.ne[3] = 1;
+    dummy_bank.nb[0] = 1;
+    dummy_bank.nb[1] = bank_total_bytes;
+    dummy_bank.nb[2] = bank_total_bytes;
+    dummy_bank.nb[3] = bank_total_bytes;
+    dummy_bank.buffer = bank_buf;
+    dummy_bank.data = ggml_backend_buffer_get_base(bank_buf);
+
+    // Primer fill enlaza cpu_b1
+    auto st1 = exsrc->fill_expert(cpu_b1, &dummy_bank, 0, &t_m1, 0, 0, 1000000);
+    TEST_CHECK(st1 == llama_expert_fill_status::LOADED, "First fill on cpu_b1 failed");
+
+    // Segundo fill con cpu_b2 -> DEBE rechazar con IO_ERROR (B3)
+    auto st2 = exsrc->fill_expert(cpu_b2, &dummy_bank, 0, &t_m1, 1, 0, 1000000);
+    TEST_CHECK(st2 == llama_expert_fill_status::IO_ERROR, "Backend mismatch did not return IO_ERROR");
+
+    // 2. Test B2: Múltiples hilos compitiendo por exactamente el mismo experto
+    std::atomic<int> success_count{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; ++i) {
+        threads.emplace_back([&]() {
+            auto s = exsrc->fill_expert(cpu_b1, &dummy_bank, 0, &t_m1, 2, i * 1000000, 1000000);
+            if (s == llama_expert_fill_status::LOADED) {
+                success_count++;
+            }
+        });
+    }
+    for (auto & th : threads) {
+        th.join();
+    }
+    TEST_CHECK(success_count.load() == 4, "Concurrent same-key fill failed");
+
+    // 3. Test B1: Destrucción limpia y segura
+    exsrc.reset();
+    ggml_backend_buffer_free(bank_buf);
+    ggml_backend_free(cpu_b1);
+    ggml_backend_free(cpu_b2);
+
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] Bloques B1-B4 robustness invariants passed all tests.\n");
+}
+
 int main() {
     printf("=== RUNNING NEXUS EXPERT SOURCE UNIT TESTS ===\n");
     test_pread_full();
     test_l2_dimensioning_and_pinning();
     test_allocator_coalescing_and_fragmentation();
     test_concurrency_and_barrier_quiescence();
+    test_b1_b4_robustness_invariants();
     printf("=== ALL NEXUS EXPERT SOURCE TESTS PASSED ===\n");
     return 0;
 }
