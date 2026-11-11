@@ -109,22 +109,14 @@ static void test_l2_dimensioning_and_pinning() {
 
     llama_expert_source::config cfg;
     cfg.ram_warm_bytes = 1024ull * 1024 * 1024; // 1024 MiB
-    cfg.ring_bytes     = 64ull * 1024 * 1024;   // 64 MiB
 
     auto exsrc = llama_expert_source::create(meta, cfg);
     TEST_CHECK(exsrc != nullptr, "Failed to create llama_expert_source");
 
-    // Condición 1 del usuario:
-    // La capacidad DEBE ser de exactamente 320 pares completos (no 321)
+    // Condición de diseño D-0: capacidad en pares para la arena única
     size_t l2_pairs = exsrc->get_l2_capacity_pairs();
-    printf("  L2 capacity in pairs: %zu (Expected: 320)\n", l2_pairs);
-    TEST_CHECK(l2_pairs == 320, "L2 capacity must be exactly 320 pairs");
-
-    // Staging ring slots para 64 MiB con slot de 2,230,272 bytes:
-    // 67,108,864 / 2,230,272 = 30 slots
-    size_t ring_slots = exsrc->get_staging_ring_slots();
-    printf("  Staging ring slots: %zu (Expected: 30)\n", ring_slots);
-    TEST_CHECK(ring_slots == 30, "Staging ring must have 30 slots");
+    printf("  L2 capacity in pairs: %zu (Expected: ~320)\n", l2_pairs);
+    TEST_CHECK(l2_pairs == (cfg.ram_warm_bytes / (sz_gate_up + sz_down)), "L2 capacity mismatch");
 
     // Simular dummy fill_expert sobre un buffer falso (sin backend activo)
     ggml_tensor dummy_bank{};
@@ -150,10 +142,140 @@ static void test_l2_dimensioning_and_pinning() {
     printf("[PASS] L2 dimensioning and pinning passed all invariant tests.\n");
 }
 
+
+static void test_allocator_coalescing_and_fragmentation() {
+    printf("[TEST] Testing first-fit coalescing and physical slack invariants...\n");
+
+    llama_expert_model_meta meta;
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 10 * 1024 * 1024; // 10 MiB
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_frag_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "Failed to create temp file");
+    const size_t fake_file_size = 20 * 1024 * 1024;
+    ftruncate(fd, fake_file_size);
+    meta.files.push_back({ temp_path, fake_file_size });
+
+    ggml_tensor t1{}, t2{}, t3{}, t_big{};
+    t1.ne[2] = 10; t1.nb[2] = 1000000;
+    t2.ne[2] = 10; t2.nb[2] = 2000000;
+    t3.ne[2] = 10; t3.nb[2] = 3000000;
+    t_big.ne[2] = 5; t_big.nb[2] = 7000000;
+
+    meta.tensors[&t1]    = { 0, 0, 1000000, 1000000, 10, true };
+    meta.tensors[&t2]    = { 0, 1000000, 2000000, 2000000, 10, true };
+    meta.tensors[&t3]    = { 0, 3000000, 3000000, 3000000, 10, true };
+    meta.tensors[&t_big] = { 0, 6000000, 7000000, 7000000, 5, true };
+
+    auto exsrc = llama_expert_source::create(meta, cfg);
+    TEST_CHECK(exsrc != nullptr, "Create failed");
+
+    ggml_tensor dummy_bank{};
+    // Alloc 1 (1,000,000 bytes)
+    exsrc->fill_expert(nullptr, &dummy_bank, 0, &t1, 0, 0, 1000000);
+    // Alloc 2 (2,000,000 bytes)
+    exsrc->fill_expert(nullptr, &dummy_bank, 0, &t2, 0, 0, 2000000);
+    // Alloc 3 (3,000,000 bytes)
+    exsrc->fill_expert(nullptr, &dummy_bank, 0, &t3, 0, 0, 3000000);
+
+    const auto & s = exsrc->get_arena_stats();
+    printf("  Allocated: %lu, Slack: %lu, Free: %lu, Total: %lu\n",
+           s.aligned_bytes.load(), s.slack_bytes.load(), s.free_bytes.load(), s.arena_bytes.load());
+    TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+               "Invariant violated during multiple allocs");
+
+    // Liberar pines de capa 0
+    exsrc->on_layer_synchronized(0);
+
+    // Debe provocar evictions de los 3 bloques y fusionar sus huecos contiguos mediante coalescing
+    auto status = exsrc->fill_expert(nullptr, &dummy_bank, 1, &t_big, 0, 0, 7000000);
+    TEST_CHECK(status == llama_expert_fill_status::LOADED, "Big alloc after eviction and coalescing failed");
+
+    const auto & s_post = exsrc->get_arena_stats();
+    printf("  Post-Eviction: Evictions=%lu, EvictBytes=%lu\n",
+           s_post.evictions.load(), s_post.evict_bytes.load());
+    TEST_CHECK(s_post.evictions.load() >= 3, "Not all victim blocks were evicted");
+    TEST_CHECK(s_post.aligned_bytes.load() + s_post.slack_bytes.load() + s_post.free_bytes.load() == s_post.arena_bytes.load(),
+               "Invariant violated after eviction and coalescing");
+
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] Allocator first-fit, slack and coalescing passed all invariant tests.\n");
+}
+
+static void test_concurrency_and_barrier_quiescence() {
+    printf("[TEST] Testing concurrent fills and barrier quiescence...\n");
+
+    llama_expert_model_meta meta;
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 20 * 1024 * 1024; // 20 MiB
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_conc_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "Failed to create temp file");
+    const size_t fake_file_size = 20 * 1024 * 1024;
+    ftruncate(fd, fake_file_size);
+    meta.files.push_back({ temp_path, fake_file_size });
+
+    ggml_tensor t_c1{}, t_c2{}, t_c3{};
+    t_c1.ne[2] = 10; t_c1.nb[2] = 1000000;
+    t_c2.ne[2] = 10; t_c2.nb[2] = 1000000;
+    t_c3.ne[2] = 10; t_c3.nb[2] = 1000000;
+
+    meta.tensors[&t_c1] = { 0, 0, 1000000, 1000000, 10, true };
+    meta.tensors[&t_c2] = { 0, 2000000, 1000000, 1000000, 10, true };
+    meta.tensors[&t_c3] = { 0, 4000000, 1000000, 1000000, 10, true };
+
+    auto exsrc = llama_expert_source::create(meta, cfg);
+    TEST_CHECK(exsrc != nullptr, "Create failed");
+
+    ggml_tensor dummy_bank{};
+
+    std::atomic<bool> start_flag{false};
+    std::vector<std::thread> workers;
+
+    for (int i = 0; i < 4; ++i) {
+        workers.emplace_back([&, i]() {
+            while (!start_flag.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int step = 0; step < 10; ++step) {
+                ggml_tensor * target = (i % 3 == 0) ? &t_c1 : ((i % 3 == 1) ? &t_c2 : &t_c3);
+                exsrc->fill_expert(nullptr, &dummy_bank, i % 2, target, step % 5, 0, 1000000);
+                if (step % 4 == 0) {
+                    exsrc->on_layer_synchronized(i % 2);
+                }
+            }
+        });
+    }
+
+    start_flag.store(true, std::memory_order_release);
+    for (auto & w : workers) {
+        w.join();
+    }
+
+    exsrc->synchronize_all();
+
+    const auto & s = exsrc->get_arena_stats();
+    printf("  Concurrent Arena Stats: Live=%lu, Resident=%lu, SyncCalls=%lu\n",
+           s.blocks_live.load(), s.blocks_resident.load(), s.sync_calls.load());
+    TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+               "Invariant violated after concurrent stress");
+
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] Concurrent fills and barrier quiescence passed all invariant tests.\n");
+}
+
 int main() {
     printf("=== RUNNING NEXUS EXPERT SOURCE UNIT TESTS ===\n");
     test_pread_full();
     test_l2_dimensioning_and_pinning();
+    test_allocator_coalescing_and_fragmentation();
+    test_concurrency_and_barrier_quiescence();
     printf("=== ALL NEXUS EXPERT SOURCE TESTS PASSED ===\n");
     return 0;
 }

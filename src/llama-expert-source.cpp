@@ -11,8 +11,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <limits>
 #include <list>
+#include <map>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -20,6 +23,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// Hash para llama_expert_key
+size_t llama_expert_key_hash::operator()(const llama_expert_key & k) const {
+    size_t h = std::hash<int32_t>{}(k.layer_id);
+    h ^= std::hash<uintptr_t>{}(k.tensor_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int32_t>{}(k.expert_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+}
+
+// Lectura canónica robusta desde NVMe
 int64_t llama_expert_pread_full(int fd, void * buf, size_t count, uint64_t offset, uint64_t file_size) {
     if (count == 0) {
         return 0;
@@ -28,7 +40,6 @@ int64_t llama_expert_pread_full(int fd, void * buf, size_t count, uint64_t offse
         return -EINVAL;
     }
 
-    // Prevención estricta de desbordamiento aritmético
     if (offset > UINT64_MAX - count) {
         return -EOVERFLOW;
     }
@@ -45,12 +56,11 @@ int64_t llama_expert_pread_full(int fd, void * buf, size_t count, uint64_t offse
 
         if (n < 0) {
             if (errno == EINTR) {
-                continue; // Reintentar si fue interrumpido por señal
+                continue;
             }
             return -errno;
         }
         if (n == 0) {
-            // EOF prematuro antes de completar los bytes solicitados
             return -EIO;
         }
         total_read += (size_t) n;
@@ -66,21 +76,21 @@ void llama_expert_stats::log(const char * tag) const {
     }
     const uint64_t l2_h  = l2_hits.load();
     const uint64_t l2_m  = l2_misses.load();
-    const uint64_t proc  = proc_bytes.load();
+    const uint64_t bytes = proc_bytes.load();
     const uint64_t us    = io_us_total.load();
-    const uint64_t mx    = io_us_max.load();
-    const double avg_us  = l2_m > 0 ? double(us) / l2_m : 0.0;
-    const double l2_rate = total > 0 ? 100.0 * l2_h / total : 0.0;
+    const uint64_t max_u = io_us_max.load();
+    const double avg_us  = (l2_m > 0) ? (double) us / l2_m : 0.0;
+    const double mb      = (double) bytes / (1024.0 * 1024.0);
+    const double thr     = (us > 0) ? (mb / ((double) us / 1000000.0)) : 0.0;
 
     LLAMA_LOG_INFO(
-        "nexus_expert_stream [%s]: fills=%zu | L2: hits=%zu (%.1f%%), misses=%zu | "
-        "NVMe read=%.2f MiB | latency: avg=%.1f us, max=%zu us | drops=%zu\n",
-        tag, (size_t) total, (size_t) l2_h, l2_rate, (size_t) l2_m,
-        proc / 1048576.0, avg_us, (size_t) mx, (size_t) drops.load());
-    if (verify_ok.load() + verify_fail.load() > 0) {
-        LLAMA_LOG_INFO("nexus_expert_stream [%s]: byte-verify ok=%zu, fail=%zu\n",
-            tag, (size_t) verify_ok.load(), (size_t) verify_fail.load());
-    }
+        "nexus-expert-stream [%s]: fills=%lu (L2 hit=%lu miss=%lu | hit_rate=%.1f%%) | NVMe: %.2f MiB, avg=%.1f us, max=%lu us (%.2f MiB/s)\n",
+        tag,
+        (unsigned long) total,
+        (unsigned long) l2_h,
+        (unsigned long) l2_m,
+        100.0 * (double) l2_h / (double) total,
+        mb, avg_us, (unsigned long) max_u, thr);
 }
 
 void llama_expert_stats::reset() {
@@ -95,78 +105,178 @@ void llama_expert_stats::reset() {
     verify_fail.store(0);
 }
 
+// ---------------------------------------------------------------------------
+// Allocator First-Fit & Cuarentena
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool safe_align_up(size_t req_bytes, size_t A, size_t & out_aligned) noexcept {
+    if (A == 0 || (A & (A - 1)) != 0) {
+        return false;
+    }
+    if (req_bytes > SIZE_MAX - (A - 1)) {
+        return false;
+    }
+    size_t res = (req_bytes + (A - 1)) & ~(A - 1);
+    if (res < req_bytes) {
+        return false;
+    }
+    out_aligned = res;
+    return true;
+}
+
+enum class fail_reason {
+    none,
+    epoch_overflow,
+    sync_failed,
+    teardown_sync_failed,
+    inflight_without_block,
+    inflight_underflow,
+    residual_inflight,
+    lifetime_violation
+};
+
+struct quarantine_node {
+    ggml_backend_buffer_t arena_buf   = nullptr;
+    void *                arena_base  = nullptr;
+    size_t                arena_bytes = 0;
+    bool                  owns_arena  = false;
+    ggml_backend_t        backend     = nullptr;
+    fail_reason           reason      = fail_reason::none;
+    bool                  fail_stop   = false;
+    quarantine_node *     next        = nullptr;
+};
+
+static_assert(std::is_nothrow_default_constructible<quarantine_node>::value,
+    "quarantine_node must be nothrow default constructible");
+
+struct process_arena_quarantine {
+    static_assert(
+        std::atomic<quarantine_node *>::is_always_lock_free,
+        "nexus D-0 requires lock-free pointer atomics for the quarantine list");
+
+    std::atomic<quarantine_node *> head{nullptr};
+
+    void enroll(quarantine_node * node) noexcept {
+        if (!node) return;
+        quarantine_node * current = head.load(std::memory_order_relaxed);
+        do {
+            node->next = current;
+        } while (!head.compare_exchange_weak(
+            current, node,
+            std::memory_order_release,
+            std::memory_order_relaxed));
+    }
+};
+
+static process_arena_quarantine g_arena_quarantine;
+
+} // namespace
+
+// Metadatos por bloque vivo
+struct nexus_l2_block {
+    size_t                offset          = 0;
+    size_t                size            = 0;
+    size_t                slack           = 0;
+    size_t                req_bytes       = 0;
+    llama_expert_content  content         = llama_expert_content::EMPTY;
+    int32_t               pin_layers      = 0;
+    int32_t               inflight        = 0;
+    bool                  needs_proof     = false;
+    uint64_t              lru_tick        = 0;
+    uint64_t              last_fill_epoch = 0;
+    std::list<llama_expert_key>::iterator lru_it;
+};
+
 struct llama_expert_source::impl {
+    struct fill_active_guard;
+
     struct shard_file {
         std::string path;
         int         fd   = -1;
         uint64_t    size = 0;
     };
 
-    struct l2_key {
-        int32_t il;
-        const ggml_tensor * w;
-        int32_t expert;
-
-        bool operator==(const l2_key & o) const {
-            return il == o.il && w == o.w && expert == o.expert;
-        }
-    };
-
-    struct l2_key_hash {
-        size_t operator()(const l2_key & k) const {
-            size_t h = std::hash<int32_t>{}(k.il);
-            h ^= std::hash<const void *>{}(k.w) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            h ^= std::hash<int32_t>{}(k.expert) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            return h;
-        }
-    };
-
-    struct l2_entry {
-        size_t   arena_type = 0; // 0 = gate_up/large, 1 = down/small
-        size_t   slot_idx   = 0;
-        bool     pinned     = false;
-        int32_t  layer_id   = -1;
-        std::list<l2_key>::iterator lru_it;
-    };
-
-    struct stage_slot {
-        void *   ptr  = nullptr;
-        size_t   size = 0;
-        bool     busy = false;
-        int32_t  layer_id = -1;
-        ggml_backend_buffer_t buf = nullptr;
-    };
-
     config cfg;
     std::vector<shard_file> shards;
     std::unordered_map<const ggml_tensor *, llama_expert_tensor_meta> extents;
 
-    // Dimensiones de expertos detectadas
-    size_t size_gate_up = 0;
-    size_t size_down    = 0;
+    size_t size_gate_up    = 0;
+    size_t size_down       = 0;
     size_t max_expert_size = 0;
 
-    // L2 Warm RAM Cache (partición exacta)
-    size_t max_l2_pairs = 0; // 320 pares completos para 1024 MiB en Gemma 4
-    std::vector<uint8_t> arena_gate_up;
-    std::vector<uint8_t> arena_down;
-    std::vector<bool>    gate_up_free;
-    std::vector<bool>    down_free;
+    // Memoria física de la arena L2 única
+    ggml_backend_buffer_t arena_buf   = nullptr;
+    void *                arena_base  = nullptr;
+    size_t                arena_bytes = 0;
+    size_t                alignment   = 0;
+    bool                  owns_arena  = false;
+    llama_expert_mem_kind mem_kind    = llama_expert_mem_kind::PAGEABLE_HOST;
 
-    std::list<l2_key> l2_lru_list;
-    std::unordered_map<l2_key, l2_entry, l2_key_hash> l2_index;
-    std::mutex l2_mutex;
+    // Allocator First-Fit
+    std::map<size_t, size_t> free_holes; // offset -> size
+    size_t aligned_bytes = 0;
+    size_t slack_bytes   = 0;
+    size_t free_bytes    = 0;
 
-    // Staging Ring
-    std::vector<stage_slot> ring_slots;
-    std::mutex ring_mutex;
-    std::condition_variable ring_cv;
-    ggml_backend_t last_backend = nullptr;
+    // Índice de bloques y LRU
+    std::unordered_map<llama_expert_key, nexus_l2_block, llama_expert_key_hash> l2_index;
+    std::list<llama_expert_key> l2_lru_list;
+    uint64_t current_lru_tick = 0;
 
+    // Concurrencia y Barrera
+    mutable std::mutex l2_mutex;
+    std::condition_variable cv_idle;
+    std::condition_variable cv_gate;
+    std::condition_variable cv_quiescent;
+
+    bool     gate_closed       = false;
+    uint64_t gate_epoch        = 0;
+    int      programming_fills = 0;
+    int      parked_fills      = 0;
+    int      active_fills      = 0;
+    bool     barrier_active    = false;
+    bool     teardown          = false;
+    bool     aborted           = false;
+    bool     frozen            = false;
+
+    // Tracking de epochs y sincronización
+    uint64_t fill_epoch = 0;
+    uint64_t last_confirmed_epoch = 0;
+    struct inflight_entry {
+        llama_expert_key key;
+        uint64_t epoch;
+    };
+    std::list<inflight_entry> l2_inflight;
+
+    // Backend
+    ggml_backend_t bound_backend = nullptr;
+    enum class sync_mode { UNKNOWN, HOST_ONLY, CPU_SYNC, CALLBACK_SYNC };
+    sync_mode effective_sync_mode = sync_mode::UNKNOWN;
+
+    // Fail-Stop & Cuarentena
+    std::atomic_flag fail_stop_claimed = ATOMIC_FLAG_INIT;
+    std::atomic<bool> fatal{false};
+    std::unique_ptr<quarantine_node> preallocated_quarantine;
+
+    // Estadísticas
     llama_expert_stats stats;
+    mutable llama_expert_arena_stats arena_stats;
+
+    // Contadores de eventos
+    uint64_t evictions         = 0;
+    uint64_t evict_bytes       = 0;
+    uint64_t evict_slack_bytes = 0;
+    uint64_t sync_calls        = 0;
+    uint64_t sync_failures     = 0;
+    uint64_t alloc_fail        = 0;
+    uint64_t oom_rejects       = 0;
+
+    impl() = default;
 
     ~impl() {
-        synchronize_backend();
+        drain_for_teardown();
         stats.log("shutdown");
 
         for (auto & s : shards) {
@@ -176,47 +286,334 @@ struct llama_expert_source::impl {
             }
         }
 
-        for (auto & slot : ring_slots) {
-            if (slot.buf) {
-                ggml_backend_buffer_free(slot.buf);
-                slot.buf = nullptr;
-                slot.ptr = nullptr;
-            } else if (slot.ptr) {
-                free(slot.ptr);
-                slot.ptr = nullptr;
-            }
+        if (arena_buf) {
+            ggml_backend_buffer_free(arena_buf);
+            arena_buf = nullptr;
+            arena_base = nullptr;
+        } else if (owns_arena && arena_base) {
+            free(arena_base);
+            arena_base = nullptr;
         }
     }
 
-    void synchronize_backend() {
-        if (last_backend) {
-            ggml_backend_synchronize(last_backend);
+    [[noreturn]] void enter_fail_stop(fail_reason reason) noexcept {
+        if (fail_stop_claimed.test_and_set(std::memory_order_acq_rel)) {
+            for (;;) {
+                std::this_thread::yield();
+            }
         }
+
+        fatal.store(true, std::memory_order_release);
+
+        if (preallocated_quarantine) {
+            quarantine_node * q = preallocated_quarantine.release();
+            q->arena_buf   = arena_buf;
+            q->arena_base  = arena_base;
+            q->arena_bytes = arena_bytes;
+            q->owns_arena  = owns_arena;
+            q->backend     = bound_backend;
+            q->reason      = reason;
+            q->fail_stop   = true;
+
+            g_arena_quarantine.enroll(q);
+        }
+
+        std::_Exit(EXIT_FAILURE);
     }
 
-    void * acquire_stage(size_t required_size, int32_t layer_id) {
-        std::unique_lock<std::mutex> lock(ring_mutex);
-        for (;;) {
-            for (auto & slot : ring_slots) {
-                if (!slot.busy && slot.size >= required_size) {
-                    slot.busy = true;
-                    slot.layer_id = layer_id;
-                    return slot.ptr;
+    // Allocator First-Fit
+    bool alloc_block(size_t req_bytes, size_t & out_offset, size_t & out_size, size_t & out_slack) {
+        size_t req = 0;
+        if (!safe_align_up(req_bytes, alignment, req)) {
+            return false;
+        }
+
+        for (auto it = free_holes.begin(); it != free_holes.end(); ++it) {
+            size_t h_offset = it->first;
+            size_t h_size   = it->second;
+
+            if (h_size >= req) {
+                size_t rem = h_size - req;
+                out_offset = h_offset;
+                out_size   = req;
+
+                if (rem == 0) {
+                    out_slack = 0;
+                    free_holes.erase(it);
+                } else if (rem < alignment) {
+                    out_slack = rem;
+                    free_holes.erase(it);
+                } else {
+                    out_slack = 0;
+                    free_holes.erase(it);
+                    free_holes[h_offset + req] = rem;
                 }
+
+                aligned_bytes += out_size;
+                slack_bytes   += out_slack;
+                free_bytes    -= (out_size + out_slack);
+                return true;
             }
-            stats.drops++;
-            // Si el anillo está saturado, forzamos sincronización del backend para reciclar
-            if (last_backend) {
-                lock.unlock();
-                ggml_backend_synchronize(last_backend);
-                lock.lock();
-                for (auto & slot : ring_slots) {
-                    slot.busy = false;
-                }
-                ring_cv.notify_all();
-            } else {
-                ring_cv.wait(lock);
+        }
+        return false;
+    }
+
+    void free_block(size_t offset, size_t size, size_t slack) {
+        size_t total = size + slack;
+        aligned_bytes -= size;
+        slack_bytes   -= slack;
+        free_bytes    += total;
+
+        auto next = free_holes.lower_bound(offset);
+        auto prev = (next != free_holes.begin()) ? std::prev(next) : free_holes.end();
+
+        size_t new_offset = offset;
+        size_t new_size   = total;
+
+        if (prev != free_holes.end() && prev->first + prev->second == offset) {
+            new_offset = prev->first;
+            new_size  += prev->second;
+            free_holes.erase(prev);
+        }
+
+        if (next != free_holes.end() && offset + total == next->first) {
+            new_size += next->second;
+            free_holes.erase(next);
+        }
+
+        free_holes[new_offset] = new_size;
+    }
+
+    bool evict_lru_victim() {
+        for (auto it = l2_lru_list.rbegin(); it != l2_lru_list.rend(); ++it) {
+            auto idx_it = l2_index.find(*it);
+            if (idx_it == l2_index.end()) continue;
+
+            nexus_l2_block & blk = idx_it->second;
+            if (blk.content == llama_expert_content::RESIDENT &&
+                blk.pin_layers == 0 &&
+                blk.inflight == 0 &&
+                !blk.needs_proof &&
+                last_confirmed_epoch >= blk.last_fill_epoch) {
+
+                free_block(blk.offset, blk.size, blk.slack);
+                evictions++;
+                evict_bytes += blk.size;
+                evict_slack_bytes += blk.slack;
+
+                l2_lru_list.erase(blk.lru_it);
+                l2_index.erase(idx_it);
+                return true;
             }
+        }
+        return false;
+    }
+
+    bool resolve_sync(uint64_t /* sync_epoch */) {
+        if (effective_sync_mode == sync_mode::HOST_ONLY) {
+            return l2_inflight.empty();
+        }
+        if (effective_sync_mode == sync_mode::CPU_SYNC) {
+            return l2_inflight.empty();
+        }
+        if (effective_sync_mode == sync_mode::CALLBACK_SYNC) {
+            try {
+                ggml_backend_synchronize(bound_backend);
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    void process_inflight_upto(uint64_t sync_epoch) {
+        for (auto it = l2_inflight.begin(); it != l2_inflight.end(); ) {
+            if (it->epoch > sync_epoch) {
+                ++it;
+                continue;
+            }
+            auto b_it = l2_index.find(it->key);
+            if (b_it == l2_index.end()) {
+                enter_fail_stop(fail_reason::inflight_without_block);
+            }
+            nexus_l2_block & blk = b_it->second;
+            if (blk.inflight == 0) {
+                enter_fail_stop(fail_reason::inflight_underflow);
+            }
+            --blk.inflight;
+            it = l2_inflight.erase(it);
+        }
+        last_confirmed_epoch = sync_epoch;
+    }
+
+    void synchronize_active_fill() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        while (gate_closed) {
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+            --programming_fills;
+            ++parked_fills;
+            cv_quiescent.notify_all();
+            const uint64_t my_epoch = gate_epoch;
+            cv_gate.wait(lk, [&]{
+                return teardown || aborted || fatal.load(std::memory_order_relaxed) || gate_epoch != my_epoch;
+            });
+            ++programming_fills;
+            --parked_fills;
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+        }
+
+        gate_closed    = true;
+        barrier_active = true;
+
+        cv_quiescent.wait(lk, [&]{
+            return teardown || aborted || fatal.load(std::memory_order_relaxed) || programming_fills == 1;
+        });
+
+        if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
+            if (teardown) {
+                gate_closed = true;
+                barrier_active = false;
+                return;
+            }
+            gate_closed = false;
+            barrier_active = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
+        ++sync_calls;
+        const uint64_t sync_epoch = fill_epoch;
+        lk.unlock();
+
+        const bool sync_ok = resolve_sync(sync_epoch);
+
+        lk.lock();
+        if (!sync_ok) {
+            ++sync_failures;
+            lk.unlock();
+            enter_fail_stop(fail_reason::sync_failed);
+        }
+        process_inflight_upto(sync_epoch);
+
+        if (teardown) {
+            gate_closed = true;
+            barrier_active = false;
+            return;
+        }
+        barrier_active = false;
+        gate_closed    = false;
+        ++gate_epoch;
+        cv_gate.notify_all();
+    }
+
+    void synchronize_external() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        while (gate_closed) {
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+            const uint64_t my_epoch = gate_epoch;
+            cv_gate.wait(lk, [&]{
+                return teardown || aborted || fatal.load(std::memory_order_relaxed) || gate_epoch != my_epoch;
+            });
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+        }
+
+        gate_closed    = true;
+        barrier_active = true;
+
+        cv_quiescent.wait(lk, [&]{
+            return teardown || aborted || fatal.load(std::memory_order_relaxed) || programming_fills == 0;
+        });
+
+        if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
+            if (teardown) {
+                gate_closed = true;
+                barrier_active = false;
+                return;
+            }
+            gate_closed = false;
+            barrier_active = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
+        ++sync_calls;
+        const uint64_t sync_epoch = fill_epoch;
+        lk.unlock();
+
+        const bool sync_ok = resolve_sync(sync_epoch);
+
+        lk.lock();
+        if (!sync_ok) {
+            ++sync_failures;
+            lk.unlock();
+            enter_fail_stop(fail_reason::sync_failed);
+        }
+        process_inflight_upto(sync_epoch);
+
+        if (teardown) {
+            gate_closed = true;
+            barrier_active = false;
+            return;
+        }
+        barrier_active = false;
+        gate_closed    = false;
+        ++gate_epoch;
+        cv_gate.notify_all();
+    }
+
+    void drain_for_teardown() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        teardown    = true;
+        frozen      = true;
+        gate_closed = true;
+
+        cv_gate.notify_all();
+        cv_quiescent.notify_all();
+
+        cv_idle.wait(lk, [&]{ return active_fills == 0; });
+
+        if (barrier_active) {
+            std::_Exit(EXIT_FAILURE);
+        }
+
+        ++sync_calls;
+        const uint64_t sync_epoch = fill_epoch;
+        lk.unlock();
+
+        const bool sync_ok = resolve_sync(sync_epoch);
+
+        lk.lock();
+        if (!sync_ok) {
+            ++sync_failures;
+            lk.unlock();
+            enter_fail_stop(fail_reason::teardown_sync_failed);
+        }
+        process_inflight_upto(sync_epoch);
+    }
+};
+
+struct llama_expert_source::impl::fill_active_guard {
+    llama_expert_source::impl * im = nullptr;
+    bool armed = false;
+
+    explicit fill_active_guard(llama_expert_source::impl * p) : im(p) {}
+    void arm() noexcept { armed = true; }
+
+    ~fill_active_guard() {
+        if (armed && im) {
+            std::lock_guard<std::mutex> lk(im->l2_mutex);
+            --im->active_fills;
+            --im->programming_fills;
+            if (im->active_fills == 0) {
+                im->cv_idle.notify_all();
+            }
+            im->cv_quiescent.notify_all();
         }
     }
 };
@@ -225,10 +622,37 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
         const llama_expert_model_meta & meta,
         const config & cfg) {
 
-    auto p = std::make_unique<impl>();
+    if (::getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE") != nullptr) {
+        LLAMA_LOG_ERROR("nexus: GGML_VK_ASYNC_USE_TRANSFER_QUEUE must be unset for D-0; dedicated transfer queue excluded\n");
+        return nullptr;
+    }
+    if (cfg.path_2) {
+        LLAMA_LOG_ERROR("nexus: config.path_2 is excluded until X-02 is certified\n");
+        return nullptr;
+    }
+
+    std::unique_ptr<quarantine_node> q_node;
+    try {
+        quarantine_node * q_raw = new (std::nothrow) quarantine_node();
+        if (!q_raw) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: failed to preallocate quarantine node\n");
+            return nullptr;
+        }
+        q_node.reset(q_raw);
+    } catch (...) {
+        return nullptr;
+    }
+
+    std::unique_ptr<impl> p;
+    try {
+        p = std::make_unique<impl>();
+        p->preallocated_quarantine = std::move(q_node);
+    } catch (...) {
+        return nullptr;
+    }
+
     p->cfg = cfg;
 
-    // 1. Abrir shards
     p->shards.resize(meta.files.size());
     for (size_t i = 0; i < meta.files.size(); ++i) {
         p->shards[i].path = meta.files[i].path;
@@ -241,7 +665,6 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
         }
     }
 
-    // 2. Indexar tensores y calcular dimensiones máximas
     p->extents = meta.tensors;
     for (const auto & kv : p->extents) {
         if (!kv.second.is_supported) {
@@ -250,9 +673,9 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
         size_t sz = (size_t) kv.second.expert_bytes;
         p->max_expert_size = std::max(p->max_expert_size, sz);
         if (sz >= 2000000) {
-            p->size_gate_up = sz; // tensor mayor (~2,23 MiB en Gemma 4)
+            p->size_gate_up = sz;
         } else {
-            p->size_down = sz;    // tensor menor (~1,11 MiB en Gemma 4)
+            p->size_down = sz;
         }
     }
 
@@ -264,64 +687,40 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
     if (p->size_gate_up == 0) p->size_gate_up = p->max_expert_size;
     if (p->size_down == 0)    p->size_down    = p->max_expert_size;
 
-    // 3. Inicializar Caché L2 Warm RAM (Cálculo corregido: 320 pares exactos para 1024 MiB)
-    const size_t pair_bytes = p->size_gate_up + p->size_down;
-    if (cfg.ram_warm_bytes >= pair_bytes) {
-        p->max_l2_pairs = cfg.ram_warm_bytes / pair_bytes;
-        // Si el usuario especificó el default de 1024 MiB, asegurar exactamente 320 pares
-        if (cfg.ram_warm_bytes == 1024ull * 1024 * 1024) {
-            p->max_l2_pairs = std::min<size_t>(p->max_l2_pairs, 320);
-        }
+    p->arena_bytes = cfg.ram_warm_bytes;
+    p->alignment   = cfg.alignment > 0 ? cfg.alignment : 64;
 
-        p->arena_gate_up.resize(p->max_l2_pairs * p->size_gate_up);
-        p->arena_down.resize(p->max_l2_pairs * p->size_down);
-        p->gate_up_free.assign(p->max_l2_pairs, true);
-        p->down_free.assign(p->max_l2_pairs, true);
-
-        const size_t total_l2_allocated = (p->max_l2_pairs * p->size_gate_up) + (p->max_l2_pairs * p->size_down);
-        LLAMA_LOG_INFO(
-            "nexus-expert-stream: L2 warm cache configured: %zu pairs (%.2f MiB total | gate_up: %zu, down: %zu)\n",
-            p->max_l2_pairs, total_l2_allocated / 1048576.0, p->size_gate_up, p->size_down);
-    } else {
-        LLAMA_LOG_INFO("nexus-expert-stream: L2 warm cache disabled\n");
+    // Inicializar reserva host independiente con posix_memalign
+    constexpr size_t MAX_ALIGN = ((size_t) 1) << (std::numeric_limits<size_t>::digits - 1);
+    if (p->alignment == 0 || (p->alignment & (p->alignment - 1)) != 0 ||
+        p->alignment % sizeof(void *) != 0 || p->alignment > MAX_ALIGN) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: invalid alignment requested: %zu\n", p->alignment);
+        return nullptr;
     }
 
-    // 4. Inicializar Staging Ring Vulkan Host-Pinned
-    size_t ring_slots_count = std::max<size_t>(4, cfg.ring_bytes / p->max_expert_size);
-    p->ring_slots.resize(ring_slots_count);
-
-    ggml_backend_buffer_type_t buft = nullptr;
-#if defined(GGML_USE_VULKAN)
-    buft = ggml_backend_vk_host_buffer_type();
-#endif
-
-    for (size_t i = 0; i < ring_slots_count; ++i) {
-        p->ring_slots[i].size = p->max_expert_size;
-        p->ring_slots[i].busy = false;
-        p->ring_slots[i].layer_id = -1;
-
-        if (buft) {
-            p->ring_slots[i].buf = ggml_backend_buft_alloc_buffer(buft, p->max_expert_size);
-            if (p->ring_slots[i].buf) {
-                p->ring_slots[i].ptr = ggml_backend_buffer_get_base(p->ring_slots[i].buf);
-            }
-        }
-
-        if (!p->ring_slots[i].ptr) {
-            int res = posix_memalign(&p->ring_slots[i].ptr, 4096, p->max_expert_size);
-            if (res != 0) {
-                LLAMA_LOG_ERROR("nexus-expert-stream: failed to allocate staging ring memory\n");
-                return nullptr;
-            }
-        }
+    int res = posix_memalign(&p->arena_base, p->alignment, p->arena_bytes);
+    if (res != 0 || !p->arena_base) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: failed to allocate L2 arena (%zu bytes): %s\n",
+            p->arena_bytes, strerror(res));
+        return nullptr;
     }
 
-    LLAMA_LOG_INFO("nexus-expert-stream: staging ring initialized: %zu slots (%.2f MiB total)\n",
-        ring_slots_count, (ring_slots_count * p->max_expert_size) / 1048576.0);
+    p->owns_arena = true;
+    p->arena_buf  = nullptr;
+    p->mem_kind   = llama_expert_mem_kind::PAGEABLE_HOST;
 
-    auto res = std::make_unique<llama_expert_source>();
-    res->pimpl = std::move(p);
-    return res;
+    p->free_holes[0] = p->arena_bytes;
+    p->aligned_bytes = 0;
+    p->slack_bytes   = 0;
+    p->free_bytes    = p->arena_bytes;
+
+    LLAMA_LOG_INFO(
+        "nexus-expert-stream: L2 single arena initialized: %.2f MiB (alignment: %zu, first-fit coalescing)\n",
+        (double) p->arena_bytes / (1024.0 * 1024.0), p->alignment);
+
+    auto result = std::make_unique<llama_expert_source>();
+    result->pimpl = std::move(p);
+    return result;
 }
 
 llama_expert_source::~llama_expert_source() = default;
@@ -336,64 +735,125 @@ llama_expert_fill_status llama_expert_source::fill_expert(
         size_t expert_size) {
 
     auto & p = *pimpl;
-    p.last_backend = backend;
+    impl::fill_active_guard guard(&p);
+
+    {
+        std::lock_guard<std::mutex> lk(p.l2_mutex);
+        if (p.teardown || p.frozen || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+            return llama_expert_fill_status::IO_ERROR;
+        }
+        ++p.active_fills;
+        ++p.programming_fills;
+        guard.arm();
+
+        // Enlazar backend y clasificar modo en el primer fill
+        if (!p.bound_backend && backend) {
+            p.bound_backend = backend;
+#if defined(GGML_USE_VULKAN)
+            if (ggml_backend_is_vk(backend)) {
+                p.effective_sync_mode = impl::sync_mode::CALLBACK_SYNC;
+            } else
+#endif
+            {
+                p.effective_sync_mode = impl::sync_mode::CPU_SYNC;
+            }
+        } else if (!p.bound_backend && !backend) {
+            p.effective_sync_mode = impl::sync_mode::HOST_ONLY;
+        }
+    }
 
     auto it_ext = p.extents.find(w);
     if (it_ext == p.extents.end() || !it_ext->second.is_supported) {
         return llama_expert_fill_status::FALLBACK_ALLOWED;
     }
 
-    const auto & ext = it_ext->second;
+    if (expert_size > p.arena_bytes) {
+        return llama_expert_fill_status::NOT_SUPPORTED;
+    }
+
     p.stats.fills++;
+    llama_expert_key key { il, reinterpret_cast<uintptr_t>(w), expert };
 
-    const void * src_data = nullptr;
-    void * stage_used = nullptr;
-
-    const bool is_gate_up = (expert_size == p.size_gate_up);
-    const size_t arena_type = is_gate_up ? 0 : 1;
-
-    // --- 1. Consulta en L2 Warm Cache ---
-    impl::l2_key key { il, w, expert };
-    if (p.max_l2_pairs > 0) {
-        std::lock_guard<std::mutex> lock(p.l2_mutex);
-        auto it_l2 = p.l2_index.find(key);
-        if (it_l2 != p.l2_index.end()) {
+    // --- 1. Consulta L2 Cache ---
+    bool is_hit = false;
+    size_t blk_offset = 0;
+    {
+        std::lock_guard<std::mutex> lk(p.l2_mutex);
+        auto it = p.l2_index.find(key);
+        if (it != p.l2_index.end() && it->second.content == llama_expert_content::RESIDENT) {
+            is_hit = true;
             p.stats.l2_hits++;
-            it_l2->second.pinned = true;
-            it_l2->second.layer_id = il;
+            nexus_l2_block & blk = it->second;
+            blk.pin_layers++;
+            blk.lru_tick = ++p.current_lru_tick;
+            blk_offset = blk.offset;
 
-            // Mover al frente de la lista LRU
-            p.l2_lru_list.erase(it_l2->second.lru_it);
+            p.l2_lru_list.erase(blk.lru_it);
             p.l2_lru_list.push_front(key);
-            it_l2->second.lru_it = p.l2_lru_list.begin();
-
-            if (arena_type == 0) {
-                src_data = p.arena_gate_up.data() + it_l2->second.slot_idx * p.size_gate_up;
-            } else {
-                src_data = p.arena_down.data() + it_l2->second.slot_idx * p.size_down;
-            }
+            blk.lru_it = p.l2_lru_list.begin();
         }
     }
 
-    // --- 2. Lectura L3 NVMe ante Miss ---
-    if (!src_data) {
+    // --- 2. Miss: Asignación y carga NVMe ---
+    if (!is_hit) {
         p.stats.l2_misses++;
-        stage_used = p.acquire_stage(expert_size, il);
-        if (!stage_used) {
-            return llama_expert_fill_status::OUT_OF_MEMORY;
+        size_t alloc_off = 0;
+        size_t alloc_sz  = 0;
+        size_t alloc_slk = 0;
+
+        {
+            std::unique_lock<std::mutex> ul(p.l2_mutex);
+            while (!p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk)) {
+                if (!p.evict_lru_victim()) {
+                    ul.unlock();
+                    p.synchronize_active_fill();
+                    ul.lock();
+
+                    if (!p.evict_lru_victim()) {
+                        p.alloc_fail++;
+                        p.oom_rejects++;
+                        return llama_expert_fill_status::OUT_OF_MEMORY;
+                    }
+                }
+            }
+
+            nexus_l2_block blk;
+            blk.offset     = alloc_off;
+            blk.size       = alloc_sz;
+            blk.slack      = alloc_slk;
+            blk.req_bytes  = expert_size;
+            blk.content    = llama_expert_content::LOADING;
+            blk.pin_layers = 1;
+            blk.inflight   = 0;
+            blk.lru_tick   = ++p.current_lru_tick;
+
+            p.l2_lru_list.push_front(key);
+            blk.lru_it = p.l2_lru_list.begin();
+            p.l2_index[key] = blk;
+            blk_offset = alloc_off;
         }
 
+        // Lectura desde NVMe fuera de l2_mutex
+        const auto & ext = it_ext->second;
         const int fd = p.shards[ext.shard_idx].fd;
         const uint64_t file_offset = ext.base_offset + (uint64_t) expert * ext.expert_stride;
         const uint64_t file_size   = p.shards[ext.shard_idx].size;
 
+        void * dst_ptr = static_cast<uint8_t *>(p.arena_base) + blk_offset;
+
         const auto t0 = std::chrono::steady_clock::now();
-        int64_t n_read = llama_expert_pread_full(fd, stage_used, expert_size, file_offset, file_size);
+        int64_t n_read = llama_expert_pread_full(fd, dst_ptr, expert_size, file_offset, file_size);
         const auto t1 = std::chrono::steady_clock::now();
 
         if (n_read != (int64_t) expert_size) {
-            LLAMA_LOG_ERROR("nexus-expert-stream: pread_full error (%zd) for %s exp %d\n",
-                (ssize_t) n_read, ggml_get_name(w), expert);
+            LLAMA_LOG_ERROR("nexus-expert-stream: pread_full failed for %s exp %d\n", ggml_get_name(w), expert);
+            std::lock_guard<std::mutex> lk(p.l2_mutex);
+            auto it = p.l2_index.find(key);
+            if (it != p.l2_index.end()) {
+                p.free_block(it->second.offset, it->second.size, it->second.slack);
+                p.l2_lru_list.erase(it->second.lru_it);
+                p.l2_index.erase(it);
+            }
             return llama_expert_fill_status::IO_ERROR;
         }
 
@@ -402,74 +862,68 @@ llama_expert_fill_status llama_expert_source::fill_expert(
         p.stats.io_us_total += us;
 
         uint64_t cur_max = p.stats.io_us_max.load();
-        while (us > cur_max && !p.stats.io_us_max.compare_exchange_weak(cur_max, us));
+        while (us > cur_max && !p.stats.io_us_max.compare_exchange_weak(cur_max, us)) {
+        }
 
-        // Verificación byte a byte contra w->data si está habilitado
-        if (p.cfg.verify && w->data) {
-            const uint8_t * ref = (const uint8_t *) w->data + expert * ext.expert_stride;
-            if (memcmp(stage_used, ref, expert_size) == 0) {
-                p.stats.verify_ok++;
-            } else {
-                p.stats.verify_fail++;
-                LLAMA_LOG_ERROR("nexus-expert-stream: VERIFY FAILED for %s layer %d exp %d\n",
-                    ggml_get_name(w), il, expert);
+        // Transición atómica de LOADING a RESIDENT
+        {
+            std::lock_guard<std::mutex> lk(p.l2_mutex);
+            auto it = p.l2_index.find(key);
+            if (it != p.l2_index.end()) {
+                it->second.content = llama_expert_content::RESIDENT;
+            }
+        }
+    }
+
+    // --- 3. Programación de la transferencia VRAM con Protocolo de Barrera ---
+    if (backend && bank) {
+        std::unique_lock<std::mutex> lk(p.l2_mutex);
+
+        if (p.fatal.load(std::memory_order_relaxed)) {
+            return llama_expert_fill_status::IO_ERROR;
+        }
+
+        while (p.gate_closed) {
+            if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+                return llama_expert_fill_status::IO_ERROR;
+            }
+            --p.programming_fills;
+            ++p.parked_fills;
+            p.cv_quiescent.notify_all();
+
+            const uint64_t my_epoch = p.gate_epoch;
+            p.cv_gate.wait(lk, [&]{
+                return p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed) || p.gate_epoch != my_epoch;
+            });
+
+            ++p.programming_fills;
+            --p.parked_fills;
+
+            if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
                 return llama_expert_fill_status::IO_ERROR;
             }
         }
 
-        // Inserción en L2 Warm Cache
-        if (p.max_l2_pairs > 0) {
-            std::lock_guard<std::mutex> lock(p.l2_mutex);
-            auto & free_vec = is_gate_up ? p.gate_up_free : p.down_free;
-            uint8_t * arena_base = is_gate_up ? p.arena_gate_up.data() : p.arena_down.data();
-            const size_t slot_bytes = is_gate_up ? p.size_gate_up : p.size_down;
-
-            size_t slot_idx = size_t(-1);
-
-            // Buscar slot libre
-            for (size_t i = 0; i < p.max_l2_pairs; ++i) {
-                if (free_vec[i]) {
-                    slot_idx = i;
-                    free_vec[i] = false;
-                    break;
-                }
-            }
-
-            // Si está llena la arena, buscar víctima LRU no-pinned del mismo tipo
-            if (slot_idx == size_t(-1)) {
-                for (auto it = p.l2_lru_list.rbegin(); it != p.l2_lru_list.rend(); ++it) {
-                    auto it_map = p.l2_index.find(*it);
-                    if (it_map != p.l2_index.end() && it_map->second.arena_type == arena_type && !it_map->second.pinned) {
-                        slot_idx = it_map->second.slot_idx;
-                        p.l2_lru_list.erase(it_map->second.lru_it);
-                        p.l2_index.erase(it_map);
-                        break;
-                    }
-                }
-            }
-
-            if (slot_idx != size_t(-1)) {
-                uint8_t * dst_l2 = arena_base + slot_idx * slot_bytes;
-                memcpy(dst_l2, stage_used, expert_size);
-
-                p.l2_lru_list.push_front(key);
-                impl::l2_entry entry;
-                entry.arena_type = arena_type;
-                entry.slot_idx   = slot_idx;
-                entry.pinned     = true;
-                entry.layer_id   = il;
-                entry.lru_it     = p.l2_lru_list.begin();
-
-                p.l2_index[key] = entry;
-            }
+        if (p.fatal.load(std::memory_order_relaxed)) {
+            return llama_expert_fill_status::IO_ERROR;
         }
 
-        src_data = stage_used;
-    }
+        // Protección defensiva contra overflow de epochs
+        if (p.fill_epoch == UINT64_MAX) {
+            p.enter_fail_stop(fail_reason::epoch_overflow);
+        }
 
-    // --- 3. Programación de la transferencia asíncrona hacia VRAM ---
-    if (backend && bank) {
-        ggml_backend_tensor_set_async(backend, bank, src_data, slot_offset, expert_size);
+        auto it = p.l2_index.find(key);
+        if (it != p.l2_index.end()) {
+            it->second.inflight++;
+            it->second.last_fill_epoch = ++p.fill_epoch;
+            p.l2_inflight.push_back({ key, p.fill_epoch });
+        }
+
+        lk.unlock();
+
+        void * src_ptr = static_cast<uint8_t *>(p.arena_base) + blk_offset;
+        ggml_backend_tensor_set_async(backend, bank, src_ptr, slot_offset, expert_size);
     }
 
     return llama_expert_fill_status::LOADED;
@@ -477,59 +931,103 @@ llama_expert_fill_status llama_expert_source::fill_expert(
 
 void llama_expert_source::on_layer_synchronized(int32_t il) {
     auto & p = *pimpl;
-
-    // Desmarcar pins de L2 para capas anteriores o iguales a il
-    if (p.max_l2_pairs > 0) {
-        std::lock_guard<std::mutex> lock(p.l2_mutex);
-        for (auto & kv : p.l2_index) {
-            if (kv.second.pinned && kv.second.layer_id <= il) {
-                kv.second.pinned = false;
-            }
+    std::lock_guard<std::mutex> lk(p.l2_mutex);
+    for (auto & kv : p.l2_index) {
+        if (kv.second.pin_layers > 0 && kv.first.layer_id <= il) {
+            kv.second.pin_layers = 0;
         }
-    }
-
-    // Liberar stages utilizados en capas anteriores o iguales a il
-    {
-        std::lock_guard<std::mutex> lock(p.ring_mutex);
-        for (auto & slot : p.ring_slots) {
-            if (slot.busy && slot.layer_id <= il) {
-                slot.busy = false;
-                slot.layer_id = -1;
-            }
-        }
-        p.ring_cv.notify_all();
     }
 }
 
 void llama_expert_source::synchronize_all() {
-    auto & p = *pimpl;
-    p.synchronize_backend();
-
-    if (p.max_l2_pairs > 0) {
-        std::lock_guard<std::mutex> lock(p.l2_mutex);
-        for (auto & kv : p.l2_index) {
-            kv.second.pinned = false;
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(p.ring_mutex);
-        for (auto & slot : p.ring_slots) {
-            slot.busy = false;
-            slot.layer_id = -1;
-        }
-        p.ring_cv.notify_all();
-    }
+    pimpl->synchronize_external();
 }
 
 const llama_expert_stats & llama_expert_source::get_stats() const {
     return pimpl->stats;
 }
 
-size_t llama_expert_source::get_l2_capacity_pairs() const {
-    return pimpl->max_l2_pairs;
+const llama_expert_arena_stats & llama_expert_source::get_arena_stats() const {
+    auto & p = *pimpl;
+    std::lock_guard<std::mutex> lk(p.l2_mutex);
+
+    p.arena_stats.arena_bytes.store(p.arena_bytes);
+    p.arena_stats.aligned_bytes.store(p.aligned_bytes);
+    p.arena_stats.slack_bytes.store(p.slack_bytes);
+    p.arena_stats.free_bytes.store(p.free_bytes);
+
+    size_t resident = 0, invalid = 0, pinned = 0, inflight = 0;
+    size_t bytes_l = 0;
+    for (const auto & kv : p.l2_index) {
+        const auto & b = kv.second;
+        if (b.content == llama_expert_content::RESIDENT) resident++;
+        if (b.content == llama_expert_content::LOADING)  { bytes_l += b.size; }
+        if (b.content == llama_expert_content::INVALID)  invalid++;
+        if (b.pin_layers > 0) pinned++;
+        if (b.inflight > 0)   inflight++;
+    }
+
+    p.arena_stats.blocks_live.store(p.l2_index.size());
+    p.arena_stats.blocks_resident.store(resident);
+    p.arena_stats.blocks_invalid.store(invalid);
+    p.arena_stats.blocks_pinned.store(pinned);
+    p.arena_stats.blocks_inflight.store(inflight);
+    p.arena_stats.bytes_loading.store(bytes_l);
+
+    size_t largest_hole = 0;
+    for (const auto & h : p.free_holes) {
+        largest_hole = std::max(largest_hole, h.second);
+    }
+    p.arena_stats.largest_free_hole.store(largest_hole);
+    p.arena_stats.align_a.store(p.alignment);
+
+    p.arena_stats.evictions.store(p.evictions);
+    p.arena_stats.evict_bytes.store(p.evict_bytes);
+    p.arena_stats.evict_slack_bytes.store(p.evict_slack_bytes);
+    p.arena_stats.sync_calls.store(p.sync_calls);
+    p.arena_stats.sync_failures.store(p.sync_failures);
+    p.arena_stats.alloc_fail.store(p.alloc_fail);
+    p.arena_stats.oom_rejects.store(p.oom_rejects);
+
+    return p.arena_stats;
 }
 
-size_t llama_expert_source::get_staging_ring_slots() const {
-    return pimpl->ring_slots.size();
+bool llama_expert_source::get_block_info(const llama_expert_key & key, llama_expert_block_info & out) const {
+    auto & p = *pimpl;
+    std::lock_guard<std::mutex> lk(p.l2_mutex);
+    auto it = p.l2_index.find(key);
+    if (it == p.l2_index.end()) {
+        return false;
+    }
+    const auto & b = it->second;
+    out.content     = b.content;
+    out.pin_layers  = b.pin_layers;
+    out.inflight    = b.inflight;
+    out.needs_proof = b.needs_proof;
+    out.lru_tick    = b.lru_tick;
+    out.offset      = b.offset;
+    out.size        = b.size;
+    out.slack       = b.slack;
+    out.mem_kind    = p.mem_kind;
+    return true;
+}
+
+size_t llama_expert_source::get_l2_capacity_pairs() const {
+    auto & p = *pimpl;
+    const size_t pair_sz = p.size_gate_up + p.size_down;
+    if (pair_sz == 0) return 0;
+    return p.arena_bytes / pair_sz;
+}
+
+size_t llama_expert_source::get_l2_block_count() const {
+    std::lock_guard<std::mutex> lk(pimpl->l2_mutex);
+    return pimpl->l2_index.size();
+}
+
+size_t llama_expert_source::get_arena_bytes() const {
+    return pimpl->arena_bytes;
+}
+
+llama_expert_mem_kind llama_expert_source::get_l2_mem_kind() const {
+    return pimpl->mem_kind;
 }
