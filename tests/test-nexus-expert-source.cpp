@@ -99,6 +99,185 @@ static void test_d163_fatal_rollback_propagation() {
     unlink(temp_path);
 }
 
+static void test_d164_allocator_invariants_and_concurrency() {
+    printf("[TEST] Testing D-1.6.4 allocator invariants and terminal concurrency...\n");
+
+    llama_expert_model_meta meta;
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 4 * 1024 * 1024;
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_d164_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t file_size = 32 * 1024 * 1024;
+    TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+    meta.files.push_back({ temp_path, file_size });
+
+    ggml_tensor t{};
+    t.ne[2] = 16;
+    t.nb[2] = 1024 * 1024;
+    meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 16, true,
+                         0, llama_expert_tensor_role::GATE_UP,
+                         llama_expert_tensor_validation::VALID };
+
+    const size_t MB = 1024 * 1024;
+    ggml_tensor dummy_bank{};
+
+    auto inv_ok = [&](llama_expert_source * es) {
+        const auto & s = es->get_arena_stats();
+        return s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load();
+    };
+
+    // 1+2+4+9. Fallo al reinsertar el remainder: se restaura el hueco ORIGINAL
+    // (no el remainder), la contabilidad queda coherente y el allocator se
+    // recupera; despues se llena la arena hasta el tope y free_bytes coincide
+    // con la capacidad real.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "seed fill failed");
+        es->on_layer_synchronized(0); // bloque 0 evictable si hace falta
+
+        // La primera llamada al hook de alloc_block es la reinsercion del
+        // remainder; falla y se restaura el hueco original.
+        llama_expert_source::test_arm_allocblock_failure(0);
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 1, 0, MB);
+        llama_expert_source::test_disarm_allocblock_failure();
+
+        TEST_CHECK(st == llama_expert_fill_status::LOADED,
+                   "a single remainder-insert failure must be recoverable");
+        TEST_CHECK(inv_ok(es.get()), "invariant must hold after the recoverable failure");
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == 3 * MB,
+                   "free_bytes must match the real holes (3 MiB after 1 block)");
+
+        // Llenar hasta el tope: los 4 bloques de 1 MiB deben caber con la
+        // contabilidad correcta (si free_bytes no reflejara los huecos reales,
+        // el invariante o el conteo de bloques fallaria).
+        for (int e = 2; e <= 3; ++e) {
+            es->on_layer_synchronized(0);
+            st = es->fill_expert(nullptr, &dummy_bank, 0, &t, e, 0, MB);
+            TEST_CHECK(st == llama_expert_fill_status::LOADED, "capacity fill failed");
+        }
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == 1 * MB,
+                   "free_bytes must track capacity as it fills (3->2->1 MiB)");
+        for (int e = 4; e <= 6; ++e) {
+            es->on_layer_synchronized(0);
+            st = es->fill_expert(nullptr, &dummy_bank, 0, &t, e, 0, MB);
+            TEST_CHECK(st == llama_expert_fill_status::LOADED, "evicting fill failed");
+        }
+        TEST_CHECK(inv_ok(es.get()), "invariant after evicting fills");
+
+        es->drain();
+        es.reset();
+    }
+
+    // 3+5. Doble fallo (remainder + restauracion): terminal, SIN eviction,
+    // arena en cuarentena, llenados posteriores rechazados.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "seed fill failed");
+        es->on_layer_synchronized(0); // evictable, para confirmar que NO se evicta
+
+        llama_expert_source::test_arm_allocblock_failure(-2); // fallar siempre
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 1, 0, MB);
+        llama_expert_source::test_disarm_allocblock_failure();
+
+        TEST_CHECK(st == llama_expert_fill_status::IO_ERROR,
+                   "a double allocator failure must be IO_ERROR, not OOM");
+        TEST_CHECK(es->was_arena_quarantined(),
+                   "the arena must be quarantined after a double failure");
+        TEST_CHECK(es->get_arena_stats().evictions.load() == 0,
+                   "no eviction may run after an internal allocator failure");
+        TEST_CHECK(es->get_arena_stats().blocks_live.load() == 1,
+                   "no new block may be published");
+
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 2, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::IO_ERROR,
+                   "fills after an internal failure must be rejected");
+        es.reset();
+    }
+
+    // 7+8. Tras un estado terminal: begin_sync() no op, fills rechazados sin
+    // bloquearse, drain() completa sin espera indefinida.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        llama_expert_source::test_arm_alloc_failure(-2);
+        llama_expert_source::test_arm_restore_failure(-2);
+        auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, MB);
+        llama_expert_source::test_disarm_alloc_failure();
+        llama_expert_source::test_disarm_restore_failure();
+        TEST_CHECK(st == llama_expert_fill_status::IO_ERROR, "terminal trigger failed");
+
+        es->begin_sync(); // fatal: no debe cerrar la compuerta ni bloquearse
+        es->end_sync();
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 1, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::IO_ERROR,
+                   "a fill after terminal must not wait on the gate");
+
+        es->drain(); // no debe esperar indefinidamente por hilos inexistentes
+        TEST_CHECK(es->was_arena_quarantined(), "drain after terminal keeps the quarantine");
+        es.reset();
+    }
+
+    // 6. Hilo esperando en cv_loading cuando otro hilo activa fatal: la
+    // notificacion terminal despierta al esperador de forma determinista.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+
+        llama_expert_source::test_pause_loader();
+        std::atomic<llama_expert_fill_status> loader_status{llama_expert_fill_status::LOADED};
+        std::atomic<llama_expert_fill_status> waiter_status{llama_expert_fill_status::LOADED};
+        std::thread loader([&]() {
+            loader_status.store(es->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, MB),
+                                std::memory_order_release);
+        });
+        // Esperar a que el cargador este pausado en la ventana LOADING.
+        while (!llama_expert_source::test_loader_paused()) {
+            std::this_thread::yield();
+        }
+
+        std::thread waiter([&]() {
+            waiter_status.store(es->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, MB),
+                                std::memory_order_release);
+        });
+        // El esperador debe quedar bloqueado en cv_loading (la clave es LOADING
+        // y el cargador esta pausado); esperar con rendimiento corto.
+        for (int i = 0; i < 1000; ++i) {
+            std::this_thread::yield();
+        }
+
+        // Activar fatal desde el hilo principal: fallo de publicacion + rollback
+        // imposible -> enter_terminal notifica cv_loading.
+        llama_expert_source::test_arm_alloc_failure(-2);
+        llama_expert_source::test_arm_restore_failure(-2);
+        auto main_status = es->fill_expert(nullptr, &dummy_bank, 0, &t, 1, 0, MB);
+        llama_expert_source::test_disarm_alloc_failure();
+        llama_expert_source::test_disarm_restore_failure();
+        TEST_CHECK(main_status == llama_expert_fill_status::IO_ERROR, "terminal trigger failed");
+
+        waiter.join();
+        TEST_CHECK(waiter_status.load(std::memory_order_acquire) == llama_expert_fill_status::IO_ERROR,
+                   "a cv_loading waiter must be woken by the terminal notification");
+
+        llama_expert_source::test_release_loader();
+        loader.join();
+        TEST_CHECK(es->was_arena_quarantined(), "the arena must be quarantined");
+        TEST_CHECK(loader_status.load(std::memory_order_acquire) == llama_expert_fill_status::IO_ERROR,
+                   "the paused loader must observe the terminal state");
+        es.reset();
+    }
+
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] D-1.6.4 allocator invariants and terminal concurrency passed.\n");
+}
+
 static void test_d162_publication_rollback() {
     printf("[TEST] Testing D-1.6.2 publication rollback after allocation failures...\n");
 
@@ -1877,6 +2056,7 @@ int main() {
     test_d161_transactional_allocator();
     test_d162_publication_rollback();
     test_d163_fatal_rollback_propagation();
+    test_d164_allocator_invariants_and_concurrency();
 #endif
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();

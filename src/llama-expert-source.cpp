@@ -197,6 +197,15 @@ enum class fail_reason {
     rollback_failed
 };
 
+// Resultado del allocator para distinguir exito, capacidad insuficiente y fallo
+// interno (D-1.6.4, hallazgo 2). Un fallo interno activa fatal y retira la arena:
+// el llamante NO debe evictar ni reintentar.
+enum class alloc_result {
+    OK,
+    NO_CAPACITY,
+    INTERNAL_FAILURE,
+};
+
 // NOTA DE GARANTIA (D-1.6.2, objetivo D): std::map::extract(const_iterator) y
 // std::map::insert(node_type&&) NO estan marcados noexcept por libstdc++ (los
 // static_assert de esta garantia fallan), por lo que no se afirma "noexcept".
@@ -275,6 +284,39 @@ static bool nexus_test_fail_restore() noexcept {
         return false;
     }
     return g_nexus_test_restore_fail.fetch_sub(1, std::memory_order_relaxed) == 0;
+}
+
+// Gancho independiente para fallar la reinsercion del remainder en alloc_block
+// (hallazgo 1). Mantiene separadas las fases de publicacion de las del allocator.
+static std::atomic<long long> g_nexus_test_allocblock_fail{-1};
+
+static bool nexus_test_fail_allocblock() noexcept {
+    const long long v = g_nexus_test_allocblock_fail.load(std::memory_order_relaxed);
+    if (v == -2) {
+        return true;
+    }
+    if (v < 0) {
+        return false;
+    }
+    return g_nexus_test_allocblock_fail.fetch_sub(1, std::memory_order_relaxed) == 0;
+}
+
+// Pausa determinista del cargador (test-only): cuando esta activa, el hilo que
+// carga un experto se detiene en la ventana LOADING antes del pread, de modo
+// que la prueba puede colocar esperadores en cv_loading de forma determinista.
+static std::mutex g_test_pause_mutex;
+static std::condition_variable g_test_pause_cv;
+static std::atomic<bool> g_test_pause_loader{false};
+static std::atomic<bool> g_test_loader_paused{false};
+
+static void nexus_test_pause_loader() {
+    if (g_test_pause_loader.load(std::memory_order_acquire)) {
+        g_test_loader_paused.store(true, std::memory_order_release);
+        std::unique_lock<std::mutex> lk(g_test_pause_mutex);
+        g_test_pause_cv.wait(lk, []{
+            return !g_test_pause_loader.load(std::memory_order_acquire);
+        });
+    }
 }
 #endif // GGML_NEXUS_TEST_HOOKS
 
@@ -558,17 +600,20 @@ struct llama_expert_source::impl {
     // el nodo extraido conserva el hueco original y se entrega via
     // out_restore_node: el llamante lo sostiene durante la publicacion del
     // bloque para que el rollback pueda reinsertarlo sin asignar. Si deja un
-    // remainder (rem >= alignment), el rollback se fusiona con el (no-throw).
-    bool alloc_block(size_t req_bytes, size_t & out_offset, size_t & out_size, size_t & out_slack,
-                     std::map<size_t, size_t>::node_type * out_restore_node = nullptr) {
+    // remainder (rem >= alignment), el rollback se fusiona con el.
+    //
+    // Devuelve alloc_result::INTERNAL_FAILURE (con fatal + cuarentena) si un
+    // fallo interno impide continuar; el llamante NO debe evictar ni reintentar.
+    alloc_result alloc_block(size_t req_bytes, size_t & out_offset, size_t & out_size, size_t & out_slack,
+                             std::map<size_t, size_t>::node_type * out_restore_node = nullptr) {
         size_t req = 0;
         if (!safe_align_up(req_bytes, alignment, req)) {
-            return false;
+            return alloc_result::NO_CAPACITY;
         }
 
         for (auto it = free_holes.begin(); it != free_holes.end(); ++it) {
-            size_t h_offset = it->first;
-            size_t h_size   = it->second;
+            const size_t h_offset = it->first;
+            const size_t h_size   = it->second;
 
             if (h_size >= req) {
                 size_t rem = h_size - req;
@@ -584,26 +629,57 @@ struct llama_expert_source::impl {
                     out_slack = 0;
                     node.key()    = h_offset + req;
                     node.mapped() = rem;
-                    // En la practica no puede lanzar (comparador std::less<size_t>
-                    // noexcept y sin asignacion nueva: insert(node_type&&) reutiliza
-                    // el nodo). libstdc++ no marca la firma como noexcept; ante un
-                    // fallo teorico se restaura el hueco y, si el fallo es doble, se
-                    // aplica la politica terminal (quarantena + fatal) para no dejar
-                    // una inconsistencia silenciosa entre free_holes y free_bytes.
+                    // En la practica insert(node_type&&) no lanza (comparador
+                    // noexcept, sin asignacion nueva). El hook TEST-ONLY se lanza
+                    // DENTRO del try para que el catch del allocator maneje el
+                    // fallo real. Si ocurriera, se RESTAURA el hueco ORIGINAL
+                    // {h_offset: h_size} (no el remainder): los contadores no se
+                    // han tocado aun, y free_holes debe volver a representar
+                    // exactamente el hueco completo.
                     try {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+                        // inyeccion TEST-ONLY: fallo al reinsertar el remainder.
+                        if (nexus_test_fail_allocblock()) {
+                            throw std::bad_alloc();
+                        }
+#endif
                         free_holes.insert(std::move(node));
                     } catch (...) {
+                        bool restored = false;
                         if (node) {
+                            node.key()    = h_offset;
+                            node.mapped() = h_size;
                             try {
-                                free_holes.emplace(node.key(), node.mapped());
+#if defined(GGML_NEXUS_TEST_HOOKS)
+                                if (nexus_test_fail_allocblock()) {
+                                    throw std::bad_alloc();
+                                }
+#endif
+                                free_holes.insert(std::move(node));
+                                restored = true;
                             } catch (...) {
-                                LLAMA_LOG_ERROR("nexus-expert-stream: allocator double-failure, "
-                                                "quarantining the arena\n");
-                                fatal.store(true, std::memory_order_release);
-                                quarantine_arena(fail_reason::rollback_failed);
+                                // cae al emplace alternativo
                             }
                         }
-                        return false;
+                        if (!restored) {
+                            try {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+                                if (nexus_test_fail_allocblock()) {
+                                    throw std::bad_alloc();
+                                }
+#endif
+                                free_holes.emplace(h_offset, h_size);
+                                restored = true;
+                            } catch (...) {
+                                // fallo triple terminal: la contabilidad quedaria
+                                // dudosa; se retira la arena y se marca fatal.
+                                LLAMA_LOG_ERROR("nexus-expert-stream: allocator double-failure, "
+                                                "quarantining the arena\n");
+                                enter_terminal(fail_reason::rollback_failed);
+                                return alloc_result::INTERNAL_FAILURE;
+                            }
+                        }
+                        return alloc_result::NO_CAPACITY;
                     }
                 }
 
@@ -617,10 +693,10 @@ struct llama_expert_source::impl {
                 aligned_bytes += out_size;
                 slack_bytes   += out_slack;
                 free_bytes    -= (out_size + out_slack);
-                return true;
+                return alloc_result::OK;
             }
         }
-        return false;
+        return alloc_result::NO_CAPACITY;
     }
 
     // Rollback de una region asignada por alloc_block que no llego a publicarse.
@@ -652,14 +728,26 @@ struct llama_expert_source::impl {
         return free_block(offset, size, slack); // caso merge
     }
 
-    // Politica TERMINAL ante un rollback imposible: la arena se retira (no se
-    // libera ni se reutiliza) y la fuente queda fatal. Se propaga IO_ERROR, no
-    // OUT_OF_MEMORY: el MoE cache solo trata IO_ERROR/INVALID_EXTENT como FATAL,
-    // de modo que un fallo de rollback nunca deriva en fallback mmap silencioso.
+    // Politica TERMINAL ante un rollback imposible o un fallo interno: la arena
+    // se retira (no se libera ni se reutiliza), la fuente queda fatal y se
+    // despierta a TODOS los esperadores (cv_loading, cv_gate, cv_quiescent,
+    // cv_idle) cuyas condiciones de espera dependen de `fatal` o de poder
+    // terminar. Debe llamarse con l2_mutex tomado. No invoca std::_Exit().
+    void enter_terminal(fail_reason reason) {
+        fatal.store(true, std::memory_order_release);
+        quarantine_arena(reason);
+        cv_loading.notify_all();
+        cv_gate.notify_all();
+        cv_quiescent.notify_all();
+        cv_idle.notify_all();
+    }
+
+    // Politica terminal ante un rollback imposible, vista desde fill_expert_impl:
+    // propaga IO_ERROR (no OUT_OF_MEMORY) para que el MoE cache no lo trate como
+    // OOM recuperable (solo IO_ERROR/INVALID_EXTENT producen copy FATAL).
     llama_expert_fill_status fail_rollback(const char * why) noexcept {
         LLAMA_LOG_ERROR("nexus-expert-stream: rollback failed (%s), quarantining the arena\n", why);
-        fatal.store(true, std::memory_order_release);
-        quarantine_arena(fail_reason::rollback_failed);
+        enter_terminal(fail_reason::rollback_failed);
         return llama_expert_fill_status::IO_ERROR;
     }
 
@@ -1156,6 +1244,28 @@ void llama_expert_source::test_disarm_restore_failure() {
     g_nexus_test_restore_fail.store(-1, std::memory_order_relaxed);
 }
 
+void llama_expert_source::test_arm_allocblock_failure(long long phases) {
+    g_nexus_test_allocblock_fail.store(phases, std::memory_order_relaxed);
+}
+
+void llama_expert_source::test_disarm_allocblock_failure() {
+    g_nexus_test_allocblock_fail.store(-1, std::memory_order_relaxed);
+}
+
+void llama_expert_source::test_pause_loader() {
+    g_test_pause_loader.store(true, std::memory_order_release);
+}
+
+void llama_expert_source::test_release_loader() {
+    g_test_loader_paused.store(false, std::memory_order_release);
+    g_test_pause_loader.store(false, std::memory_order_release);
+    g_test_pause_cv.notify_all();
+}
+
+bool llama_expert_source::test_loader_paused() {
+    return g_test_loader_paused.load(std::memory_order_acquire);
+}
+
 bool llama_expert_source::test_free_block(size_t offset, size_t size, size_t slack) {
     std::lock_guard<std::mutex> lk(pimpl->l2_mutex);
     return pimpl->free_block(offset, size, slack);
@@ -1592,7 +1702,9 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
         // completo, este nodo permite un rollback no-throw (reinsert sin asignar).
         std::map<size_t, size_t>::node_type restore_node;
 
-        while (!p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk, &restore_node)) {
+        alloc_result ar = p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk, &restore_node);
+        while (ar == alloc_result::NO_CAPACITY) {
+            // Capacidad insuficiente real: se puede evictar y reintentar.
             if (!p.evict_lru_victim()) {
                 lk.unlock();
                 p.synchronize_active_fill();
@@ -1607,6 +1719,12 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
                     return llama_expert_fill_status::OUT_OF_MEMORY;
                 }
             }
+            ar = p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk, &restore_node);
+        }
+        if (ar == alloc_result::INTERNAL_FAILURE) {
+            // Fallo interno: fatal activo y arena en cuarentena. NO se evicta, no
+            // se reintenta, no se toca la arena retirada. Se propaga IO_ERROR.
+            return llama_expert_fill_status::IO_ERROR;
         }
 
         // B3: el destino completo debe caber en la arena. El allocator no
@@ -1694,6 +1812,20 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
         // Mientras el bloque existe (LOADING/RESIDENT), la arena no puede
         // liberarse ni sustituirse. Un hilo que llegue a una barrera durante
         // esta ventana se pone a la espera; nunca ve la arena sin dueño.
+        {
+            std::unique_lock<std::mutex> lk(p.l2_mutex);
+            if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+                return llama_expert_fill_status::IO_ERROR;
+            }
+        }
+#if defined(GGML_NEXUS_TEST_HOOKS)
+        // pausa determinista TEST-ONLY: permite a la prueba colocar esperadores
+        // en cv_loading mientras este hilo esta en la ventana LOADING.
+        nexus_test_pause_loader();
+#endif
+        // Re-chequear el estado terminal tras una eventual espera: si la fuente
+        // entro en fatal mientras el hilo estaba en la ventana LOADING, no se
+        // publica un bloque RESIDENT ni se devuelve LOADED.
         {
             std::unique_lock<std::mutex> lk(p.l2_mutex);
             if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
@@ -1847,7 +1979,10 @@ llama_expert_fill_status llama_expert_source::fill_expert(
         status = fill_expert_impl(backend, bank, il, w, expert, slot_offset, expert_size);
     } catch (...) {
         // Nunca dejar que una excepción C++ atraviese el callback C del scheduler.
-        pimpl->fatal.store(true, std::memory_order_release);
+        // Estado interno desconocido: politica terminal con notificaciones a
+        // todos los esperadores, no solo fatal.
+        std::lock_guard<std::mutex> lk(pimpl->l2_mutex);
+        pimpl->enter_terminal(fail_reason::rollback_failed);
         status = llama_expert_fill_status::IO_ERROR;
     }
     pimpl->stats.fill_attempts.fetch_add(1, std::memory_order_relaxed);
