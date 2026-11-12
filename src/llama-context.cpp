@@ -624,12 +624,20 @@ llama_context::llama_context(
             es_cfg.ram_warm_bytes = cparams.expert_ram_size > 0 ? cparams.expert_ram_size : 1024ull * 1024 * 1024;
             es_cfg.stats          = cparams.expert_stream_stats;
             es_cfg.verify         = cparams.expert_stream_verify;
-            expert_source = llama_expert_source::create(model.expert_meta, es_cfg);
-            if (expert_source) {
+            auto es_result = llama_expert_source::create(model.expert_meta, es_cfg);
+            if (es_result.status == llama_expert_create_status::SUCCESS) {
+                expert_source = std::move(es_result.source);
                 LLAMA_LOG_INFO("%s: Nexus expert streaming source initialized (%.2f MiB L2 arena)\n",
                     __func__, (double)es_cfg.ram_warm_bytes / (1024.0 * 1024.0));
+            } else if (es_result.status == llama_expert_create_status::NO_SUPPORTED_TENSORS) {
+                // No hay tensores MoE compatibles: Nexus se desactiva y el fallback
+                // mmap es la politica permitida por el diseno.
+                LLAMA_LOG_WARN("%s: no supported MoE expert tensors, Nexus disabled (mmap fallback)\n", __func__);
             } else {
-                LLAMA_LOG_WARN("%s: failed to initialize Nexus expert source, falling back to mmap\n", __func__);
+                // INVALID_METADATA, OUT_OF_MEMORY o IO_ERROR: fallo real, no es un
+                // fallback permitido. Un experto corrompido no debe leerse via mmap.
+                LLAMA_LOG_ERROR("%s: Nexus expert source initialization failed (status %d)\n",
+                    __func__, (int) es_result.status);
             }
         }
 

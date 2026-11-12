@@ -946,17 +946,21 @@ struct llama_expert_source::impl::fill_active_guard {
     }
 };
 
-std::unique_ptr<llama_expert_source> llama_expert_source::create(
+struct llama_expert_create_result llama_expert_source::create(
         const llama_expert_model_meta & meta,
         const config & cfg) {
 
+    llama_expert_create_result result;
+
     if (::getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE") != nullptr) {
         LLAMA_LOG_ERROR("nexus: GGML_VK_ASYNC_USE_TRANSFER_QUEUE must be unset for D-0; dedicated transfer queue excluded\n");
-        return nullptr;
+        result.status = llama_expert_create_status::IO_ERROR;
+        return result;
     }
     if (cfg.path_2) {
         LLAMA_LOG_ERROR("nexus: config.path_2 is excluded until X-02 is certified\n");
-        return nullptr;
+        result.status = llama_expert_create_status::IO_ERROR;
+        return result;
     }
 
     std::unique_ptr<quarantine_node> q_node;
@@ -964,11 +968,13 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
         quarantine_node * q_raw = new (std::nothrow) quarantine_node();
         if (!q_raw) {
             LLAMA_LOG_ERROR("nexus-expert-stream: failed to preallocate quarantine node\n");
-            return nullptr;
+            result.status = llama_expert_create_status::OUT_OF_MEMORY;
+            return result;
         }
         q_node.reset(q_raw);
     } catch (...) {
-        return nullptr;
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
     }
 
     std::unique_ptr<impl> p;
@@ -976,7 +982,8 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
         p = std::make_unique<impl>();
         p->preallocated_quarantine = std::move(q_node);
     } catch (...) {
-        return nullptr;
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
     }
 
     p->cfg = cfg;
@@ -989,7 +996,8 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
         if (p->shards[i].fd < 0) {
             LLAMA_LOG_ERROR("nexus-expert-stream: cannot open shard %s: %s\n",
                 p->shards[i].path.c_str(), strerror(errno));
-            return nullptr;
+            result.status = llama_expert_create_status::IO_ERROR;
+            return result;
         }
     }
 
@@ -1005,6 +1013,62 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
     };
     std::map<int32_t, layer_expert_bytes> per_layer;
     bool capacity_known = true;
+
+    // Bloqueante B: clasificar el modelo antes de decidir. Un candidato MoE con
+    // metadatos INVALID no es "ausencia de soporte": es corrupcion y debe
+    // propagarse como error, no como fallback mmap.
+    size_t n_invalid = 0;
+    size_t n_supported = 0;
+    size_t n_unsupported = 0;
+
+    for (const auto & kv : p->extents) {
+        const auto & m = kv.second;
+        switch (m.validation) {
+            case llama_expert_tensor_validation::INVALID:
+                ++n_invalid;
+                break;
+            case llama_expert_tensor_validation::VALID:
+                ++n_supported;
+                break;
+            case llama_expert_tensor_validation::UNSUPPORTED:
+                ++n_unsupported;
+                break;
+        }
+        if (m.is_supported) {
+            ++n_supported;
+        }
+        // Revalidar los limites que este fuente servira. Un shard fuera de rango
+        // o un extent fuera del archivo no puede declararse "soportado": seria
+        // un fallback silencioso sobre metadatos corruptos.
+        if (m.is_supported) {
+            if (m.shard_idx < 0 || (size_t) m.shard_idx >= p->shards.size()) {
+                ++n_invalid;
+                continue;
+            }
+            const uint64_t shard_sz = p->shards[m.shard_idx].size;
+            if (m.expert_bytes == 0 || m.expert_stride < m.expert_bytes ||
+                m.n_expert <= 0 ||
+                (m.expert_stride != 0 &&
+                 (uint64_t) m.n_expert > (UINT64_MAX - m.base_offset) / m.expert_stride) ||
+                m.base_offset > shard_sz ||
+                (uint64_t) m.expert_bytes > shard_sz - m.base_offset) {
+                ++n_invalid;
+            }
+        }
+    }
+
+    if (n_invalid > 0) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: %zu MoE tensor(s) with invalid metadata; "
+                        "refusing to fall back to mmap\n", n_invalid);
+        result.status = llama_expert_create_status::INVALID_METADATA;
+        return result;
+    }
+    if (n_supported == 0) {
+        LLAMA_LOG_INFO("nexus-expert-stream: no supported MoE expert tensors (%zu unsupported); "
+                       "Nexus disabled, mmap fallback allowed\n", n_unsupported);
+        result.status = llama_expert_create_status::NO_SUPPORTED_TENSORS;
+        return result;
+    }
 
     for (const auto & kv : p->extents) {
         const auto & m = kv.second;
@@ -1029,7 +1093,8 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
 
     if (p->max_expert_size == 0) {
         LLAMA_LOG_ERROR("nexus-expert-stream: no supported MoE expert tensors found\n");
-        return nullptr;
+        result.status = llama_expert_create_status::NO_SUPPORTED_TENSORS;
+        return result;
     }
 
     p->pair_bytes = 0;
@@ -1057,14 +1122,16 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
     if (p->alignment == 0 || (p->alignment & (p->alignment - 1)) != 0 ||
         p->alignment % sizeof(void *) != 0 || p->alignment > MAX_ALIGN) {
         LLAMA_LOG_ERROR("nexus-expert-stream: invalid alignment requested: %zu\n", p->alignment);
-        return nullptr;
+        result.status = llama_expert_create_status::IO_ERROR;
+        return result;
     }
 
     int res = posix_memalign(&p->arena_base, p->alignment, p->arena_bytes);
     if (res != 0 || !p->arena_base) {
         LLAMA_LOG_ERROR("nexus-expert-stream: failed to allocate L2 arena (%zu bytes): %s\n",
             p->arena_bytes, strerror(res));
-        return nullptr;
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
     }
 
     p->owns_arena = true;
@@ -1080,8 +1147,9 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
         "nexus-expert-stream: L2 single arena initialized: %.2f MiB (alignment: %zu, first-fit coalescing)\n",
         (double) p->arena_bytes / (1024.0 * 1024.0), p->alignment);
 
-    auto result = std::make_unique<llama_expert_source>();
-    result->pimpl = std::move(p);
+    result.status = llama_expert_create_status::SUCCESS;
+    result.source = std::make_unique<llama_expert_source>();
+    result.source->pimpl = std::move(p);
     return result;
 }
 

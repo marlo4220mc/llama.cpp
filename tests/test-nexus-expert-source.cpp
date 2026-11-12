@@ -114,7 +114,7 @@ static void test_l2_dimensioning_and_pinning() {
     llama_expert_source::config cfg;
     cfg.ram_warm_bytes = 1024ull * 1024 * 1024; // 1024 MiB
 
-    auto exsrc = llama_expert_source::create(meta, cfg);
+    auto exsrc = llama_expert_source::create(meta, cfg).source;
     TEST_CHECK(exsrc != nullptr, "Failed to create llama_expert_source");
 
     // Condición de diseño D-0: capacidad en pares para la arena única
@@ -174,7 +174,7 @@ static void test_allocator_coalescing_and_fragmentation() {
     meta.tensors[&t3]    = { 0, 3000000, 3000000, 3000000, 10, true };
     meta.tensors[&t_big] = { 0, 6000000, 7000000, 7000000, 5, true };
 
-    auto exsrc = llama_expert_source::create(meta, cfg);
+    auto exsrc = llama_expert_source::create(meta, cfg).source;
     TEST_CHECK(exsrc != nullptr, "Create failed");
 
     ggml_tensor dummy_bank{};
@@ -234,7 +234,7 @@ static void test_concurrency_and_barrier_quiescence() {
     meta.tensors[&t_c2] = { 0, 2000000, 1000000, 1000000, 10, true };
     meta.tensors[&t_c3] = { 0, 4000000, 1000000, 1000000, 10, true };
 
-    auto exsrc = llama_expert_source::create(meta, cfg);
+    auto exsrc = llama_expert_source::create(meta, cfg).source;
     TEST_CHECK(exsrc != nullptr, "Create failed");
 
     ggml_tensor dummy_bank{};
@@ -298,7 +298,7 @@ static void test_blocker_a_concurrent_same_key() {
         t.nb[2] = 1024 * 1024;
         meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 8, true };
 
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create failed");
 
         ggml_tensor dummy_bank{};
@@ -378,7 +378,7 @@ static void test_blocker_a_concurrent_same_key() {
         // Extent dentro del archivo pero se truncara debajo antes de la lectura.
         meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 8, true };
 
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create failed");
         ggml_tensor dummy_bank{};
 
@@ -439,6 +439,110 @@ static void test_blocker_a_concurrent_same_key() {
 }
 
 
+static void test_blocker_b_create_statuses() {
+    printf("[TEST] Testing blocker B: explicit create outcomes...\n");
+
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 4 * 1024 * 1024;
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_b_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t file_size = 16 * 1024 * 1024;
+    TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+
+    // 1. Sin candidatos MoE -> NO_SUPPORTED_TENSORS (fallback mmap permitido).
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        auto res = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(res.status == llama_expert_create_status::NO_SUPPORTED_TENSORS,
+                   "empty metadata must be NO_SUPPORTED_TENSORS");
+        TEST_CHECK(res.source == nullptr, "no source may exist on failure");
+    }
+
+    // 2. Tensor valido + tensor UNSUPPORTED -> SUCCESS (el valido streama).
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        ggml_tensor ok{}, unsup{};
+        meta.tensors[&ok]    = { 0, 0,       1000000, 1000000, 4, true, 0, llama_expert_tensor_role::GATE_UP, llama_expert_tensor_validation::VALID };
+        meta.tensors[&unsup] = { 0, 8000000, 1000000, 1000000, 4, true, 0, llama_expert_tensor_role::DOWN,    llama_expert_tensor_validation::UNSUPPORTED };
+        auto res = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(res.status == llama_expert_create_status::SUCCESS,
+                   "a valid tensor plus an unsupported one must succeed");
+        TEST_CHECK(res.source != nullptr, "source must exist");
+        res.source->drain();
+        res.source.reset();
+    }
+
+    // 3. Todos los candidatos INVALID -> INVALID_METADATA (error, no fallback).
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        ggml_tensor bad1{}, bad2{};
+        meta.tensors[&bad1] = { 0, 0,       1000000, 1000000, 4, true, 0, llama_expert_tensor_role::GATE_UP, llama_expert_tensor_validation::INVALID };
+        meta.tensors[&bad2] = { 0, 8000000, 1000000, 1000000, 4, true, 0, llama_expert_tensor_role::DOWN,    llama_expert_tensor_validation::INVALID };
+        auto res = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(res.status == llama_expert_create_status::INVALID_METADATA,
+                   "all-INVALID metadata must be INVALID_METADATA");
+        TEST_CHECK(res.source == nullptr, "no source may exist on invalid metadata");
+    }
+
+    // 4. Shard inexistente -> IO_ERROR.
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ "/nonexistent/nexus_shard.bin", file_size });
+        ggml_tensor t{};
+        meta.tensors[&t] = { 0, 0, 1000000, 1000000, 4, true, 0, llama_expert_tensor_role::GATE_UP, llama_expert_tensor_validation::VALID };
+        auto res = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(res.status == llama_expert_create_status::IO_ERROR,
+                   "an unopenable shard must be IO_ERROR");
+    }
+
+    // 5. Indice de shard fuera de rango -> INVALID_METADATA.
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        ggml_tensor t{};
+        meta.tensors[&t] = { 7, 0, 1000000, 1000000, 4, true, 0, llama_expert_tensor_role::GATE_UP, llama_expert_tensor_validation::VALID };
+        auto res = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(res.status == llama_expert_create_status::INVALID_METADATA,
+                   "an out-of-range shard index must be INVALID_METADATA");
+    }
+
+    // 6. Extent fuera del archivo -> INVALID_METADATA.
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        ggml_tensor t{};
+        meta.tensors[&t] = { 0, file_size - 4096, 1000000, 1000000, 4, true, 0, llama_expert_tensor_role::GATE_UP, llama_expert_tensor_validation::VALID };
+        auto res = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(res.status == llama_expert_create_status::INVALID_METADATA,
+                   "an extent beyond the file must be INVALID_METADATA");
+    }
+
+    // 7. Reserva de arena imposible -> OUT_OF_MEMORY.
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        ggml_tensor t{};
+        meta.tensors[&t] = { 0, 0, 1000000, 1000000, 4, true, 0, llama_expert_tensor_role::GATE_UP, llama_expert_tensor_validation::VALID };
+        llama_expert_source::config huge;
+        huge.ram_warm_bytes = (size_t) -4;
+        huge.alignment      = 64;
+        auto res = llama_expert_source::create(meta, huge);
+        TEST_CHECK(res.status == llama_expert_create_status::OUT_OF_MEMORY,
+                   "an impossible arena reservation must be OUT_OF_MEMORY");
+    }
+
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] Blocker B explicit create outcomes passed.\n");
+}
+
+
 static void test_b1_b4_robustness_invariants() {
     printf("[TEST] Testing Bloques B1-B4 robustness invariants...\n");
 
@@ -458,7 +562,7 @@ static void test_b1_b4_robustness_invariants() {
     t_m1.ne[2] = 5; t_m1.nb[2] = 1000000;
     meta.tensors[&t_m1] = { 0, 0, 1000000, 1000000, 5, true };
 
-    auto exsrc = llama_expert_source::create(meta, cfg);
+    auto exsrc = llama_expert_source::create(meta, cfg).source;
     TEST_CHECK(exsrc != nullptr, "Create failed");
 
     // 1. Test B3: Backend Mismatch
@@ -538,10 +642,11 @@ static void test_two_phase_sync_and_teardown() {
     t_ok.ne[2]  = 5; t_ok.nb[2]  = 1000000;
     t_bad.ne[2] = 5; t_bad.nb[2] = 1000000;
     meta.tensors[&t_ok]  = { 0, 0, 1000000, 1000000, 5, true };
-    // extents fuera del archivo: pread_full debe fallar y propagar IO_ERROR
-    meta.tensors[&t_bad] = { 0, fake_file_size + 4096, 1000000, 1000000, 5, true };
+    // t_bad sera truncado por debajo de su extent durante la prueba: el archivo
+    // se encoge DESPUES de crear la fuente para producir un IO_ERROR fisico.
+    meta.tensors[&t_bad] = { 0, 4000000, 1000000, 1000000, 5, true };
 
-    auto exsrc = llama_expert_source::create(meta, cfg);
+    auto exsrc = llama_expert_source::create(meta, cfg).source;
     TEST_CHECK(exsrc != nullptr, "Create failed");
 
     // Antes de cualquier fill no hay nada programado: begin/end no cuentan sync
@@ -595,11 +700,9 @@ static void test_two_phase_sync_and_teardown() {
     TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 1,
                "end_sync without begin_sync must not confirm the transfer");
 
-    // Metadatos fuera del archivo: se rechazan como INVALID_EXTENT (no se
-    // confunden con un fallo fisico de lectura)
+    // t_bad tiene un extent valido: se carga normal.
     st = exsrc->fill_expert(cpu, &bank, 0, &t_bad, 0, 0, 1000000);
-    TEST_CHECK(st == llama_expert_fill_status::INVALID_EXTENT,
-               "an out-of-file extent must return INVALID_EXTENT");
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "a valid extent must load");
 
     // Error fisico de lectura: el archivo se trunca por debajo de un extent que
     // los metadatos declaraban valido. pread_full falla y se propaga IO_ERROR.
@@ -619,7 +722,7 @@ static void test_two_phase_sync_and_teardown() {
     exsrc.reset();
 
     // Destruccion sin backend enlazado (modo HOST_ONLY)
-    auto exsrc_host = llama_expert_source::create(meta, cfg);
+    auto exsrc_host = llama_expert_source::create(meta, cfg).source;
     TEST_CHECK(exsrc_host != nullptr, "Create (HOST_ONLY) failed");
     ggml_tensor dummy_bank{};
     st = exsrc_host->fill_expert(nullptr, &dummy_bank, 0, &t_ok, 0, 0, 1000000);
@@ -681,7 +784,7 @@ static void test_b2_sync_modes_and_teardown() {
     // --- 1. UNKNOWN: una fuente sin ningun fill no tiene transferencias que
     // confirmar; ni synchronize_all() ni drain() deben inventar un fallo.
     {
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create (UNKNOWN) failed");
         exsrc->synchronize_all();
         TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 0,
@@ -696,7 +799,7 @@ static void test_b2_sync_modes_and_teardown() {
 
     // --- 2. HOST_ONLY: los fills no programan transferencias.
     {
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create (HOST_ONLY) failed");
         ggml_tensor dummy_bank{};
         auto st = exsrc->fill_expert(nullptr, &dummy_bank, 0, &t_a, 0, 0, 1000000);
@@ -718,7 +821,7 @@ static void test_b2_sync_modes_and_teardown() {
     // Con la arena llena de expertos no confirmados y sus pins ya soltados, el
     // siguiente fill solo puede tener exito si sincroniza antes de expulsar.
     {
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create (CPU_SYNC) failed");
 
         auto st = exsrc->fill_expert(cpu, &bank, 0, &t_a, 0, 0, 1000000);
@@ -756,7 +859,7 @@ static void test_b2_sync_modes_and_teardown() {
     // --- 4. Teardown con barrera activa (begin_sync sin end_sync): no se puede
     // demostrar que el dispositivo dejo de leer la arena -> cuarentena.
     {
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create (barrier) failed");
         auto st = exsrc->fill_expert(cpu, &bank, 0, &t_a, 0, 0, 1000000);
         TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill before the barrier failed");
@@ -778,7 +881,7 @@ static void test_b2_sync_modes_and_teardown() {
 
     // --- 5. Un fill que espera en la compuerta cuando empieza el teardown.
     {
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create (gate wait) failed");
         auto st = exsrc->fill_expert(cpu, &bank, 0, &t_a, 0, 0, 1000000);
         TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill before the gate failed");
@@ -825,23 +928,19 @@ static void test_b3_metadata_validation() {
     llama_expert_model_meta meta;
     meta.files.push_back({ temp_path, file_size });
 
-    ggml_tensor t_ok{}, t_shard_high{}, t_shard_neg{}, t_exp_range{};
-    ggml_tensor t_size_mismatch{}, t_stride_small{}, t_overflow{}, t_out_of_file{};
+    // Los metadatos corruptos (shard fuera de rango, stride < bytes, overflow,
+    // extent fuera del archivo) se rechazan YA en create(): los cubre
+    // test_blocker_b_create_statuses. Aqui se usa un unico tensor valido y se
+    // ejercita la validacion por argumentos de fill_expert.
+    ggml_tensor t_ok{};
 
-    meta.tensors[&t_ok]            = { 0, 0,                    1000000, 1000000, 4, true };
-    meta.tensors[&t_shard_high]    = { 7, 0,                    1000000, 1000000, 4, true };
-    meta.tensors[&t_shard_neg]     = { -1, 0,                   1000000, 1000000, 4, true };
-    meta.tensors[&t_exp_range]     = { 0, 0,                    1000000, 1000000, 4, true };
-    meta.tensors[&t_size_mismatch] = { 0, 0,                    1000000, 1000000, 4, true };
-    meta.tensors[&t_stride_small]  = { 0, 0,                    1000000,  999999, 4, true };
-    meta.tensors[&t_overflow]      = { 0, UINT64_MAX - 4096,    1000000, 1000000, 4, true };
-    meta.tensors[&t_out_of_file]   = { 0, file_size - 4096,     1000000, 1000000, 4, true };
+    meta.tensors[&t_ok] = { 0, 0, 1000000, 1000000, 4, true };
 
     llama_expert_source::config cfg;
     cfg.ram_warm_bytes = 8 * 1024 * 1024;
     cfg.alignment      = 64;
 
-    auto exsrc = llama_expert_source::create(meta, cfg);
+    auto exsrc = llama_expert_source::create(meta, cfg).source;
     TEST_CHECK(exsrc != nullptr, "create failed");
 
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -862,14 +961,9 @@ static void test_b3_metadata_validation() {
                    "invalid metadata must return INVALID_EXTENT");
     };
 
-    expect_invalid(&t_shard_high,    &bank, 0, 1000000); // shard_idx fuera de rango
-    expect_invalid(&t_shard_neg,     &bank, 0, 1000000); // shard_idx negativo
-    expect_invalid(&t_exp_range,     &bank, -1, 1000000); // experto negativo
-    expect_invalid(&t_exp_range,     &bank, 4, 1000000);  // experto fuera de [0, n_expert)
-    expect_invalid(&t_size_mismatch, &bank, 0, 999999);   // expert_size != extent
-    expect_invalid(&t_stride_small,  &bank, 0, 1000000);  // stride < bytes
-    expect_invalid(&t_overflow,      &bank, 1, 1000000);  // base + expert*stride desborda
-    expect_invalid(&t_out_of_file,   &bank, 0, 1000000);  // extent fuera del archivo
+    expect_invalid(&t_ok,            &bank, -1, 1000000); // experto negativo
+    expect_invalid(&t_ok,            &bank, 4, 1000000);  // experto fuera de [0, n_expert)
+    expect_invalid(&t_ok,            &bank, 0, 999999);   // expert_size != extent
     expect_invalid(&t_ok,            &small_bank, 0, 1000000); // no cabe en el banco
 
     // backend sin banco: no puede programarse la transferencia
@@ -925,7 +1019,7 @@ static void test_b4_tensor_identity() {
         ggml_tensor big{}, small{};
         meta.tensors[&big]   = { 0, 0,        4000000, 4000000, 8, true };
         meta.tensors[&small] = { 0, 32000000, 1000000, 1000000, 8, true };
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create (unknown roles) failed");
         TEST_CHECK(exsrc->get_l2_capacity_pairs() == 0,
                    "a size threshold must not identify gate/up vs down");
@@ -941,7 +1035,7 @@ static void test_b4_tensor_identity() {
         ggml_tensor gate_up{}, down{};
         meta.tensors[&gate_up] = { 0, 0,       1000000, 1000000, 8, true, 0, llama_expert_tensor_role::GATE_UP };
         meta.tensors[&down]    = { 0, 8000000, 2000000, 2000000, 8, true, 0, llama_expert_tensor_role::DOWN };
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create (explicit roles) failed");
         TEST_CHECK(exsrc->get_l2_capacity_pairs() == cfg.ram_warm_bytes / 3000000,
                    "capacity must use the explicit roles, not the sizes");
@@ -957,7 +1051,7 @@ static void test_b4_tensor_identity() {
         meta.tensors[&gate] = { 0, 0,        2000000, 2000000, 8, true, 3, llama_expert_tensor_role::GATE };
         meta.tensors[&up]   = { 0, 16000000, 2000000, 2000000, 8, true, 3, llama_expert_tensor_role::UP   };
         meta.tensors[&down] = { 0, 32000000, 1000000, 1000000, 8, true, 3, llama_expert_tensor_role::DOWN };
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create (gate+up) failed");
         TEST_CHECK(exsrc->get_l2_capacity_pairs() == cfg.ram_warm_bytes / 5000000,
                    "a separate gate+up pair must include both tensors");
@@ -972,7 +1066,7 @@ static void test_b4_tensor_identity() {
         ggml_tensor gate_up{}, down_other{};
         meta.tensors[&gate_up]    = { 0, 0,        2000000, 2000000, 8, true, 1, llama_expert_tensor_role::GATE_UP };
         meta.tensors[&down_other] = { 0, 16000000, 1000000, 1000000, 8, true, 2, llama_expert_tensor_role::DOWN };
-        auto exsrc = llama_expert_source::create(meta, cfg);
+        auto exsrc = llama_expert_source::create(meta, cfg).source;
         TEST_CHECK(exsrc != nullptr, "create (split layers) failed");
         TEST_CHECK(exsrc->get_l2_capacity_pairs() == 0,
                    "a layer without both halves must not report a capacity");
@@ -1003,7 +1097,7 @@ static void test_b5_statistics() {
 
     llama_expert_source::config cfg;
     cfg.ram_warm_bytes = 2 * expert_bytes;
-    auto exsrc = llama_expert_source::create(meta, cfg);
+    auto exsrc = llama_expert_source::create(meta, cfg).source;
     TEST_CHECK(exsrc != nullptr, "create failed");
 
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -1030,7 +1124,7 @@ static void test_b5_statistics() {
                "proc_bytes must count only the NVMe read");
     TEST_CHECK(stats.upload_bytes.load() == 2 * expert_bytes,
                "upload_bytes must count both device uploads");
-    TEST_CHECK(stats.io_us_total.load() >= 0, "io timing counter must be readable");
+    (void) stats.io_us_total.load(); // contador legible, de tipo unsigned
 
     // Los contadores de rutas alternativas se prueban directamente para que el
     // test no dependa de fabricar mmap/capacidad insuficiente en el fixture.
@@ -1105,7 +1199,7 @@ static void test_callback_sync_vulkan() {
     cfg.ram_warm_bytes = 4 * expert_bytes;
     cfg.alignment      = 64;
 
-    auto exsrc = llama_expert_source::create(meta, cfg);
+    auto exsrc = llama_expert_source::create(meta, cfg).source;
     TEST_CHECK(exsrc != nullptr, "create (Vulkan) failed");
 
     // el banco es memoria de dispositivo, como en el MoE cache real
@@ -1254,6 +1348,7 @@ int main() {
     test_allocator_coalescing_and_fragmentation();
     test_concurrency_and_barrier_quiescence();
     test_blocker_a_concurrent_same_key();
+    test_blocker_b_create_statuses();
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();
     test_b2_sync_modes_and_teardown();

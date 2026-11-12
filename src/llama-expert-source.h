@@ -200,6 +200,9 @@ struct llama_expert_model_meta {
 // Funcion canonica para lectura robusta desde almacenamiento
 int64_t llama_expert_pread_full(int fd, void * buf, size_t count, uint64_t offset, uint64_t file_size);
 
+class llama_expert_source;
+struct llama_expert_create_result;
+
 class llama_expert_source {
 public:
     struct config {
@@ -211,7 +214,7 @@ public:
         bool   path_2         = false;              // forzar Ruta 2 (needs_proof) [experimental]
     };
 
-    static std::unique_ptr<llama_expert_source> create(
+    static llama_expert_create_result create(
         const llama_expert_model_meta & meta,
         const config & cfg);
 
@@ -284,4 +287,20 @@ private:
         int32_t expert,
         size_t slot_offset,
         size_t expert_size);
+};
+
+// Resultado no ambiguo de la inicializacion de la fuente. Un nullptr a secas
+// no basta: el contexto debe poder distinguir "no hay nada que streamear"
+// (fallback mmap permitido) de "los metadatos estan corruptos" (error).
+enum class llama_expert_create_status {
+    SUCCESS,
+    NO_SUPPORTED_TENSORS, // no hay candidatos MoE compatibles: fallback mmap permitido
+    INVALID_METADATA,     // existe un candidato MoE con metadatos invalidos: error
+    OUT_OF_MEMORY,
+    IO_ERROR,
+};
+
+struct llama_expert_create_result {
+    llama_expert_create_status status = llama_expert_create_status::IO_ERROR;
+    std::unique_ptr<llama_expert_source> source;
 };
