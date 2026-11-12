@@ -141,6 +141,16 @@ struct llama_expert_file_meta {
     uint64_t    size = 0;
 };
 
+// Rol explicito de un tensor de expertos dentro de la capa MoE. La identidad
+// gate/up vs down NUNCA se infiere por tamano ni por nombre parcial.
+enum class llama_expert_tensor_role {
+    UNKNOWN, // sin rol explicito: no se puede componer el par de la capa
+    GATE,
+    UP,
+    GATE_UP, // tensor fusionado gate+up
+    DOWN
+};
+
 struct llama_expert_tensor_meta {
     int32_t  shard_idx     = -1;
     uint64_t base_offset   = 0;
@@ -148,6 +158,8 @@ struct llama_expert_tensor_meta {
     uint64_t expert_bytes  = 0;
     int32_t  n_expert      = 0;
     bool     is_supported  = false;
+    int32_t  layer_id      = -1; // capa a la que pertenece, -1 desconocida
+    llama_expert_tensor_role role = llama_expert_tensor_role::UNKNOWN;
 };
 
 struct llama_expert_model_meta {
@@ -224,7 +236,7 @@ public:
 
     // metadatos / inspeccion para pruebas unitarias
     bool get_block_info(const llama_expert_key & key, llama_expert_block_info & out) const;
-    size_t get_l2_capacity_pairs() const; // calculado desde los tensores, nunca fijado a 320
+    size_t get_l2_capacity_pairs() const; // desde los roles/capas explicitos; 0 = desconocida, nunca fijado a 320
     size_t get_l2_block_count() const;
     size_t get_arena_bytes() const;
     llama_expert_mem_kind get_l2_mem_kind() const;

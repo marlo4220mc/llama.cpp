@@ -204,9 +204,10 @@ struct llama_expert_source::impl {
     std::vector<shard_file> shards;
     std::unordered_map<const ggml_tensor *, llama_expert_tensor_meta> extents;
 
-    size_t size_gate_up    = 0;
-    size_t size_down       = 0;
     size_t max_expert_size = 0;
+    // bytes de un par de expertos de una capa (gate_up, o gate+up, mas down);
+    // 0 = capacidad desconocida porque los roles/capas no estan identificados
+    size_t pair_bytes      = 0;
 
     // Memoria física de la arena L2 única
     ggml_backend_buffer_t arena_buf   = nullptr;
@@ -904,16 +905,36 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
     }
 
     p->extents = meta.tensors;
+
+    // B4: la identidad gate/up vs down viene de metadatos explicitos del tensor
+    // (rol y capa), nunca de un umbral de tamano. Un "par" es el conjunto de
+    // expertos que una capa necesita: gate_up, o gate + up, mas down.
+    struct layer_expert_bytes {
+        size_t total    = 0;
+        bool   has_down = false;
+        bool   has_up   = false;
+    };
+    std::map<int32_t, layer_expert_bytes> per_layer;
+    bool capacity_known = true;
+
     for (const auto & kv : p->extents) {
-        if (!kv.second.is_supported) {
+        const auto & m = kv.second;
+        if (!m.is_supported) {
             continue;
         }
-        size_t sz = (size_t) kv.second.expert_bytes;
-        p->max_expert_size = std::max(p->max_expert_size, sz);
-        if (sz >= 2000000) {
-            p->size_gate_up = sz;
+        p->max_expert_size = std::max(p->max_expert_size, (size_t) m.expert_bytes);
+
+        if (m.layer_id < 0 || m.role == llama_expert_tensor_role::UNKNOWN) {
+            // sin rol/capa explicitos no se sabe que tensores forman un par
+            capacity_known = false;
+            continue;
+        }
+        auto & lb = per_layer[m.layer_id];
+        lb.total += (size_t) m.expert_bytes;
+        if (m.role == llama_expert_tensor_role::DOWN) {
+            lb.has_down = true;
         } else {
-            p->size_down = sz;
+            lb.has_up = true;
         }
     }
 
@@ -922,8 +943,22 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
         return nullptr;
     }
 
-    if (p->size_gate_up == 0) p->size_gate_up = p->max_expert_size;
-    if (p->size_down == 0)    p->size_down    = p->max_expert_size;
+    p->pair_bytes = 0;
+    if (capacity_known && !per_layer.empty()) {
+        for (const auto & kv : per_layer) {
+            if (!kv.second.has_down || !kv.second.has_up) {
+                // una capa sin ambas mitades: el par no esta identificado
+                capacity_known = false;
+                break;
+            }
+            p->pair_bytes = std::max(p->pair_bytes, kv.second.total);
+        }
+    }
+    if (!capacity_known) {
+        p->pair_bytes = 0;
+        LLAMA_LOG_INFO("nexus-expert-stream: expert pair size unknown (tensor role/layer not provided), "
+                       "L2 capacity in pairs not reported\n");
+    }
 
     p->arena_bytes = cfg.ram_warm_bytes;
     p->alignment   = cfg.alignment > 0 ? cfg.alignment : 64;
@@ -1361,8 +1396,11 @@ bool llama_expert_source::get_block_info(const llama_expert_key & key, llama_exp
 
 size_t llama_expert_source::get_l2_capacity_pairs() const {
     auto & p = *pimpl;
-    const size_t pair_sz = p.size_gate_up + p.size_down;
-    if (pair_sz == 0) return 0;
+    const size_t pair_sz = p.pair_bytes;
+    if (pair_sz == 0) {
+        // capacidad desconocida: no se inventa una estimacion
+        return 0;
+    }
     return p.arena_bytes / pair_sz;
 }
 

@@ -108,8 +108,8 @@ static void test_l2_dimensioning_and_pinning() {
     t_down.ne[2] = 128;
     t_down.nb[2] = sz_down;
 
-    meta.tensors[&t_gate_up] = { 0, 0, sz_gate_up, sz_gate_up, 128, true };
-    meta.tensors[&t_down]    = { 0, sz_gate_up * 10, sz_down, sz_down, 128, true };
+    meta.tensors[&t_gate_up] = { 0, 0, sz_gate_up, sz_gate_up, 128, true, 0, llama_expert_tensor_role::GATE_UP };
+    meta.tensors[&t_down]    = { 0, sz_gate_up * 10, sz_down, sz_down, 128, true, 0, llama_expert_tensor_role::DOWN };
 
     llama_expert_source::config cfg;
     cfg.ram_warm_bytes = 1024ull * 1024 * 1024; // 1024 MiB
@@ -740,6 +740,87 @@ static void test_b3_metadata_validation() {
     printf("[PASS] B3 metadata and offset validation passed.\n");
 }
 
+static void test_b4_tensor_identity() {
+    printf("[TEST] Testing B4 explicit tensor identity (no size heuristic)...\n");
+
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 20 * 1024 * 1024;
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_b4_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t file_size = 64 * 1024 * 1024;
+    TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+
+    // 1. Sin rol ni capa: la capacidad en pares es desconocida, aunque los
+    // tamanos "parezcan" gate_up/down.
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        ggml_tensor big{}, small{};
+        meta.tensors[&big]   = { 0, 0,        4000000, 4000000, 8, true };
+        meta.tensors[&small] = { 0, 32000000, 1000000, 1000000, 8, true };
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create (unknown roles) failed");
+        TEST_CHECK(exsrc->get_l2_capacity_pairs() == 0,
+                   "a size threshold must not identify gate/up vs down");
+        exsrc->drain();
+        exsrc.reset();
+    }
+
+    // 2. Rol explicito con un gate_up pequeno: la capacidad se calcula por rol,
+    // no por el umbral de tamano.
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        ggml_tensor gate_up{}, down{};
+        meta.tensors[&gate_up] = { 0, 0,       1000000, 1000000, 8, true, 0, llama_expert_tensor_role::GATE_UP };
+        meta.tensors[&down]    = { 0, 8000000, 2000000, 2000000, 8, true, 0, llama_expert_tensor_role::DOWN };
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create (explicit roles) failed");
+        TEST_CHECK(exsrc->get_l2_capacity_pairs() == cfg.ram_warm_bytes / 3000000,
+                   "capacity must use the explicit roles, not the sizes");
+        exsrc->drain();
+        exsrc.reset();
+    }
+
+    // 3. gate + up separados: el par es gate + up + down.
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        ggml_tensor gate{}, up{}, down{};
+        meta.tensors[&gate] = { 0, 0,        2000000, 2000000, 8, true, 3, llama_expert_tensor_role::GATE };
+        meta.tensors[&up]   = { 0, 16000000, 2000000, 2000000, 8, true, 3, llama_expert_tensor_role::UP   };
+        meta.tensors[&down] = { 0, 32000000, 1000000, 1000000, 8, true, 3, llama_expert_tensor_role::DOWN };
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create (gate+up) failed");
+        TEST_CHECK(exsrc->get_l2_capacity_pairs() == cfg.ram_warm_bytes / 5000000,
+                   "a separate gate+up pair must include both tensors");
+        exsrc->drain();
+        exsrc.reset();
+    }
+
+    // 4. Una capa sin la mitad down (o sin gate/up) no identifica el par.
+    {
+        llama_expert_model_meta meta;
+        meta.files.push_back({ temp_path, file_size });
+        ggml_tensor gate_up{}, down_other{};
+        meta.tensors[&gate_up]    = { 0, 0,        2000000, 2000000, 8, true, 1, llama_expert_tensor_role::GATE_UP };
+        meta.tensors[&down_other] = { 0, 16000000, 1000000, 1000000, 8, true, 2, llama_expert_tensor_role::DOWN };
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create (split layers) failed");
+        TEST_CHECK(exsrc->get_l2_capacity_pairs() == 0,
+                   "a layer without both halves must not report a capacity");
+        exsrc->drain();
+        exsrc.reset();
+    }
+
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] B4 explicit tensor identity passed.\n");
+}
+
 static void test_callback_sync_vulkan() {
     printf("[TEST] Testing CALLBACK_SYNC with a real Vulkan backend...\n");
 
@@ -939,6 +1020,7 @@ int main() {
     test_two_phase_sync_and_teardown();
     test_b2_sync_modes_and_teardown();
     test_b3_metadata_validation();
+    test_b4_tensor_identity();
     test_callback_sync_vulkan();
     test_sched_abort_from_copy_callback();
     printf("=== ALL NEXUS EXPERT SOURCE TESTS PASSED ===\n");
