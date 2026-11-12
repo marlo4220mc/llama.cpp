@@ -431,9 +431,20 @@ static void test_two_phase_sync_and_teardown() {
     TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 1,
                "end_sync without begin_sync must not confirm the transfer");
 
-    // Error de lectura: se propaga y el bloque no queda como RESIDENT valido
+    // Metadatos fuera del archivo: se rechazan como INVALID_EXTENT (no se
+    // confunden con un fallo fisico de lectura)
     st = exsrc->fill_expert(cpu, &bank, 0, &t_bad, 0, 0, 1000000);
+    TEST_CHECK(st == llama_expert_fill_status::INVALID_EXTENT,
+               "an out-of-file extent must return INVALID_EXTENT");
+
+    // Error fisico de lectura: el archivo se trunca por debajo de un extent que
+    // los metadatos declaraban valido. pread_full falla y se propaga IO_ERROR.
+    TEST_CHECK(ftruncate(fd, 512 * 1024) == 0, "ftruncate failed");
+    st = exsrc->fill_expert(cpu, &bank, 0, &t_ok, 2, 0, 1000000);
     TEST_CHECK(st == llama_expert_fill_status::IO_ERROR, "pread failure must return IO_ERROR");
+
+    // restaurar el tamano para las pruebas siguientes
+    TEST_CHECK(ftruncate(fd, fake_file_size) == 0, "ftruncate restore failed");
 
     const auto & s = exsrc->get_arena_stats();
     TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
@@ -638,6 +649,97 @@ static void test_b2_sync_modes_and_teardown() {
     printf("[PASS] B2 sync modes, quiescence and teardown policies passed.\n");
 }
 
+static void test_b3_metadata_validation() {
+    printf("[TEST] Testing B3 metadata and offset validation...\n");
+
+    char temp_path[] = "/tmp/test_nexus_b3_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t file_size = 8 * 1024 * 1024;
+    TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+
+    llama_expert_model_meta meta;
+    meta.files.push_back({ temp_path, file_size });
+
+    ggml_tensor t_ok{}, t_shard_high{}, t_shard_neg{}, t_exp_range{};
+    ggml_tensor t_size_mismatch{}, t_stride_small{}, t_overflow{}, t_out_of_file{};
+
+    meta.tensors[&t_ok]            = { 0, 0,                    1000000, 1000000, 4, true };
+    meta.tensors[&t_shard_high]    = { 7, 0,                    1000000, 1000000, 4, true };
+    meta.tensors[&t_shard_neg]     = { -1, 0,                   1000000, 1000000, 4, true };
+    meta.tensors[&t_exp_range]     = { 0, 0,                    1000000, 1000000, 4, true };
+    meta.tensors[&t_size_mismatch] = { 0, 0,                    1000000, 1000000, 4, true };
+    meta.tensors[&t_stride_small]  = { 0, 0,                    1000000,  999999, 4, true };
+    meta.tensors[&t_overflow]      = { 0, UINT64_MAX - 4096,    1000000, 1000000, 4, true };
+    meta.tensors[&t_out_of_file]   = { 0, file_size - 4096,     1000000, 1000000, 4, true };
+
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 8 * 1024 * 1024;
+    cfg.alignment      = 64;
+
+    auto exsrc = llama_expert_source::create(meta, cfg);
+    TEST_CHECK(exsrc != nullptr, "create failed");
+
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    TEST_CHECK(cpu != nullptr, "failed to init the CPU backend");
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(ggml_backend_get_device(cpu));
+
+    ggml_backend_buffer_t bank_buf = ggml_backend_buft_alloc_buffer(cpu_buft, 1000000);
+    TEST_CHECK(bank_buf != nullptr, "failed to allocate the bank");
+    ggml_tensor bank = make_test_bank(bank_buf, 1000000);
+
+    ggml_backend_buffer_t small_buf = ggml_backend_buft_alloc_buffer(cpu_buft, 4096);
+    TEST_CHECK(small_buf != nullptr, "failed to allocate the small bank");
+    ggml_tensor small_bank = make_test_bank(small_buf, 4096);
+
+    auto expect_invalid = [&](const ggml_tensor * t, ggml_tensor * b, int32_t expert, size_t size) {
+        const auto st = exsrc->fill_expert(cpu, b, 0, t, expert, 0, size);
+        TEST_CHECK(st == llama_expert_fill_status::INVALID_EXTENT,
+                   "invalid metadata must return INVALID_EXTENT");
+    };
+
+    expect_invalid(&t_shard_high,    &bank, 0, 1000000); // shard_idx fuera de rango
+    expect_invalid(&t_shard_neg,     &bank, 0, 1000000); // shard_idx negativo
+    expect_invalid(&t_exp_range,     &bank, -1, 1000000); // experto negativo
+    expect_invalid(&t_exp_range,     &bank, 4, 1000000);  // experto fuera de [0, n_expert)
+    expect_invalid(&t_size_mismatch, &bank, 0, 999999);   // expert_size != extent
+    expect_invalid(&t_stride_small,  &bank, 0, 1000000);  // stride < bytes
+    expect_invalid(&t_overflow,      &bank, 1, 1000000);  // base + expert*stride desborda
+    expect_invalid(&t_out_of_file,   &bank, 0, 1000000);  // extent fuera del archivo
+    expect_invalid(&t_ok,            &small_bank, 0, 1000000); // no cabe en el banco
+
+    // backend sin banco: no puede programarse la transferencia
+    {
+        const auto st = exsrc->fill_expert(cpu, nullptr, 0, &t_ok, 0, 0, 1000000);
+        TEST_CHECK(st == llama_expert_fill_status::INVALID_EXTENT,
+                   "a transfer without a bank must return INVALID_EXTENT");
+    }
+
+    // ningun rechazo debe haber leido del archivo ni dejado bloques vivos
+    TEST_CHECK(exsrc->get_stats().proc_bytes.load() == 0,
+               "a rejected extent must not read from the file");
+    TEST_CHECK(exsrc->get_arena_stats().blocks_live.load() == 0,
+               "a rejected extent must not leave a live block");
+    const auto & s = exsrc->get_arena_stats();
+    TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+               "arena invariant violated after rejected extents");
+
+    // un extent valido sigue funcionando
+    auto st = exsrc->fill_expert(cpu, &bank, 0, &t_ok, 3, 0, 1000000);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "a valid extent must still load");
+
+    exsrc->drain();
+    TEST_CHECK(!exsrc->was_arena_quarantined(), "drain after B3 must free the arena");
+    exsrc.reset();
+
+    ggml_backend_buffer_free(small_buf);
+    ggml_backend_buffer_free(bank_buf);
+    ggml_backend_free(cpu);
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] B3 metadata and offset validation passed.\n");
+}
+
 static void test_callback_sync_vulkan() {
     printf("[TEST] Testing CALLBACK_SYNC with a real Vulkan backend...\n");
 
@@ -836,6 +938,7 @@ int main() {
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();
     test_b2_sync_modes_and_teardown();
+    test_b3_metadata_validation();
     test_callback_sync_vulkan();
     test_sched_abort_from_copy_callback();
     printf("=== ALL NEXUS EXPERT SOURCE TESTS PASSED ===\n");

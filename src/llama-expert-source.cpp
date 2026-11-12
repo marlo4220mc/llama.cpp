@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstring>
 #include <limits>
@@ -1010,6 +1011,60 @@ llama_expert_fill_status llama_expert_source::fill_expert(
         return llama_expert_fill_status::FALLBACK_ALLOWED;
     }
 
+    const auto & ext = it_ext->second;
+
+    // B3: validar los metadatos ANTES de calcular offsets. pread_full() no puede
+    // detectar un offset que ya se desbordo al calcularlo, y un extent invalido
+    // nunca debe convertirse en una lectura mmap silenciosa.
+    if (ext.shard_idx < 0 || (size_t) ext.shard_idx >= p.shards.size()) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: invalid shard index %d for %s\n",
+                ext.shard_idx, ggml_get_name(w));
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    const auto & shard = p.shards[ext.shard_idx];
+    if (shard.fd < 0) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: shard %s is not open\n", shard.path.c_str());
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (expert < 0 || ext.n_expert <= 0 || expert >= ext.n_expert) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: expert %d out of range [0, %d) for %s\n",
+                expert, ext.n_expert, ggml_get_name(w));
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (ext.expert_bytes == 0 || ext.expert_stride < ext.expert_bytes) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: invalid expert layout for %s (bytes %" PRIu64 ", stride %" PRIu64 ")\n",
+                ggml_get_name(w), ext.expert_bytes, ext.expert_stride);
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (expert_size != (size_t) ext.expert_bytes) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: expert size %zu does not match the extent %" PRIu64 " of %s\n",
+                expert_size, ext.expert_bytes, ggml_get_name(w));
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    // expert * expert_stride + base_offset sin desbordar 64 bits
+    if ((uint64_t) expert > (UINT64_MAX - ext.base_offset) / ext.expert_stride) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: offset overflow for %s (expert %d)\n", ggml_get_name(w), expert);
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    const uint64_t file_offset = ext.base_offset + (uint64_t) expert * ext.expert_stride;
+    if (file_offset > shard.size || (uint64_t) expert_size > shard.size - file_offset) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: extent of %s (expert %d) is outside shard %s\n",
+                ggml_get_name(w), expert, shard.path.c_str());
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (backend != nullptr) {
+        if (bank == nullptr) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: no bank for %s on a backend transfer\n", ggml_get_name(w));
+            return llama_expert_fill_status::INVALID_EXTENT;
+        }
+        const size_t bank_bytes = ggml_nbytes(bank);
+        if (slot_offset > bank_bytes || expert_size > bank_bytes - slot_offset) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: slot of %s does not fit the bank (%zu + %zu > %zu)\n",
+                    ggml_get_name(w), slot_offset, expert_size, bank_bytes);
+            return llama_expert_fill_status::INVALID_EXTENT;
+        }
+    }
+
     if (expert_size > p.arena_bytes) {
         return llama_expert_fill_status::NOT_SUPPORTED;
     }
@@ -1079,6 +1134,16 @@ llama_expert_fill_status llama_expert_source::fill_expert(
                 }
             }
 
+            // B3: el destino completo debe caber en la arena. El allocator no
+            // deberia entregar un rango fuera de ella; si lo hiciera, se
+            // devuelve el hueco y se rechaza el extent en vez de escribir fuera.
+            if (alloc_off > p.arena_bytes || alloc_sz > p.arena_bytes - alloc_off ||
+                expert_size > alloc_sz) {
+                p.free_block(alloc_off, alloc_sz, alloc_slk);
+                p.alloc_fail++;
+                return llama_expert_fill_status::INVALID_EXTENT;
+            }
+
             nexus_l2_block blk;
             blk.offset     = alloc_off;
             blk.size       = alloc_sz;
@@ -1095,16 +1160,12 @@ llama_expert_fill_status llama_expert_source::fill_expert(
             blk_offset = alloc_off;
         }
 
-        // Lectura desde NVMe fuera de l2_mutex
-        const auto & ext = it_ext->second;
-        const int fd = p.shards[ext.shard_idx].fd;
-        const uint64_t file_offset = ext.base_offset + (uint64_t) expert * ext.expert_stride;
-        const uint64_t file_size   = p.shards[ext.shard_idx].size;
-
+        // Lectura desde NVMe fuera de l2_mutex. `shard` y `file_offset` ya se
+        // validaron antes de asignar el bloque.
         void * dst_ptr = static_cast<uint8_t *>(p.arena_base) + blk_offset;
 
         const auto t0 = std::chrono::steady_clock::now();
-        int64_t n_read = llama_expert_pread_full(fd, dst_ptr, expert_size, file_offset, file_size);
+        int64_t n_read = llama_expert_pread_full(shard.fd, dst_ptr, expert_size, file_offset, shard.size);
         const auto t1 = std::chrono::steady_clock::now();
 
         if (n_read != (int64_t) expert_size) {
