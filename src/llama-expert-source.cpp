@@ -503,7 +503,9 @@ struct llama_expert_source::impl {
         LLAMA_LOG_INFO("nexus-expert-stream: keeping PAGEABLE_HOST arena (no pinned host buffer available)\n");
     }
 
-    // Allocator First-Fit
+    // Allocator First-Fit. Las mutaciones de free_holes usan extract()/insert()
+    // con node_type, que no asignan: un bad_alloc nunca deja el allocator a
+    // medio modificar.
     bool alloc_block(size_t req_bytes, size_t & out_offset, size_t & out_size, size_t & out_slack) {
         size_t req = 0;
         if (!safe_align_up(req_bytes, alignment, req)) {
@@ -519,16 +521,16 @@ struct llama_expert_source::impl {
                 out_offset = h_offset;
                 out_size   = req;
 
+                auto node = free_holes.extract(it); // noexcept
                 if (rem == 0) {
                     out_slack = 0;
-                    free_holes.erase(it);
                 } else if (rem < alignment) {
                     out_slack = rem;
-                    free_holes.erase(it);
                 } else {
                     out_slack = 0;
-                    free_holes.erase(it);
-                    free_holes[h_offset + req] = rem;
+                    node.key()    = h_offset + req;
+                    node.mapped() = rem;
+                    free_holes.insert(std::move(node)); // sin asignacion: noexcept
                 }
 
                 aligned_bytes += out_size;
@@ -542,28 +544,43 @@ struct llama_expert_source::impl {
 
     void free_block(size_t offset, size_t size, size_t slack) {
         size_t total = size + slack;
-        aligned_bytes -= size;
-        slack_bytes   -= slack;
-        free_bytes    += total;
 
         auto next = free_holes.lower_bound(offset);
         auto prev = (next != free_holes.begin()) ? std::prev(next) : free_holes.end();
 
         size_t new_offset = offset;
         size_t new_size   = total;
+        std::vector<decltype(free_holes)::node_type> removed;
 
         if (prev != free_holes.end() && prev->first + prev->second == offset) {
-            new_offset = prev->first;
-            new_size  += prev->second;
-            free_holes.erase(prev);
+            auto node = free_holes.extract(prev); // noexcept
+            new_offset = node.key();
+            new_size  += node.mapped();
+            removed.push_back(std::move(node));
         }
 
+        // `next` puede haberse invalidado al extraer `prev`; rebuscarlo.
+        next = free_holes.lower_bound(offset);
         if (next != free_holes.end() && offset + total == next->first) {
-            new_size += next->second;
-            free_holes.erase(next);
+            auto node = free_holes.extract(next); // noexcept
+            new_size += node.mapped();
+            removed.push_back(std::move(node));
         }
 
-        free_holes[new_offset] = new_size;
+        try {
+            free_holes.emplace(new_offset, new_size);
+        } catch (...) {
+            // Rollback completo: se reinsertan los nodos extraidos (noexcept) y
+            // los contadores no se tocan. El allocator queda como estaba.
+            for (auto & n : removed) {
+                free_holes.insert(std::move(n));
+            }
+            return;
+        }
+
+        aligned_bytes -= size;
+        slack_bytes   -= slack;
+        free_bytes    += total;
     }
 
     bool evict_lru_victim() {

@@ -636,8 +636,9 @@ llama_context::llama_context(
             } else {
                 // INVALID_METADATA, OUT_OF_MEMORY o IO_ERROR: fallo real, no es un
                 // fallback permitido. Un experto corrompido no debe leerse via mmap.
-                LLAMA_LOG_ERROR("%s: Nexus expert source initialization failed (status %d)\n",
+                LLAMA_LOG_ERROR("%s: Nexus expert source initialization failed (status %d), aborting context\n",
                     __func__, (int) es_result.status);
+                throw std::runtime_error("Nexus expert source initialization failed");
             }
         }
 
