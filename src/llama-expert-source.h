@@ -275,6 +275,12 @@ public:
     size_t get_effective_alignment() const;
     llama_expert_mem_kind get_l2_mem_kind() const;
 
+    // TEST-ONLY: arma el gancho de inyeccion de fallos del allocator. Un valor
+    // phases >= 0 hace fallar la fase asignadora numero `phases` (0 = la
+    // siguiente). -1 (o test_disarm_alloc_failure) desactiva el gancho.
+    static void test_arm_alloc_failure(long long phases);
+    static void test_disarm_alloc_failure();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

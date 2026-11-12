@@ -231,6 +231,25 @@ struct process_arena_quarantine {
 
 static process_arena_quarantine g_arena_quarantine;
 
+// Gancho de inyeccion de fallos TEST-ONLY. Cuando g_nexus_test_alloc_fail >= 0,
+// cada fase asignadora que lo consulta consume una unidad; la fase que llega a
+// 0 falla con OUT_OF_MEMORY (o devuelve false en el allocator). -1 (default)
+// desactiva el gancho. No afecta al funcionamiento normal ni a los hilos
+// productivos (solo las pruebas lo arman).
+static std::atomic<long long> g_nexus_test_alloc_fail{-1};
+
+static bool nexus_test_fail_alloc() noexcept {
+    const long long v = g_nexus_test_alloc_fail.load(std::memory_order_relaxed);
+    if (v == -2) {
+        // modo "fallar siempre hasta desarmar": solo lo usan las pruebas
+        return true;
+    }
+    if (v < 0) {
+        return false;
+    }
+    return g_nexus_test_alloc_fail.fetch_sub(1, std::memory_order_relaxed) == 0;
+}
+
 } // namespace
 
 // Metadatos por bloque vivo
@@ -542,45 +561,60 @@ struct llama_expert_source::impl {
         return false;
     }
 
-    void free_block(size_t offset, size_t size, size_t slack) {
+    // Libera [offset, size+slack) de vuelta a free_holes. Devuelve true solo si
+    // el hueco quedo reinsertado y los contadores actualizados. NUNCA deja el
+    // allocator a medio modificar:
+    //   - caso con vecinos: los nodos se extraen (noexcept) y el hueco fusionado
+    //     se reinserta reutilizando el nodo extraido, sin ninguna asignacion;
+    //   - caso de hueco nuevo: la unica operacion asignadora se intenta antes de
+    //     tocar nada; si falla, no se modifica ni free_holes ni los contadores.
+    bool free_block(size_t offset, size_t size, size_t slack) {
         size_t total = size + slack;
 
         auto next = free_holes.lower_bound(offset);
         auto prev = (next != free_holes.begin()) ? std::prev(next) : free_holes.end();
 
-        size_t new_offset = offset;
-        size_t new_size   = total;
-        std::vector<decltype(free_holes)::node_type> removed;
+        const bool merges_prev = prev != free_holes.end() && prev->first + prev->second == offset;
+        const bool merges_next = next != free_holes.end() && offset + total == next->first;
 
-        if (prev != free_holes.end() && prev->first + prev->second == offset) {
+        if (merges_prev) {
             auto node = free_holes.extract(prev); // noexcept
-            new_offset = node.key();
-            new_size  += node.mapped();
-            removed.push_back(std::move(node));
-        }
-
-        // `next` puede haberse invalidado al extraer `prev`; rebuscarlo.
-        next = free_holes.lower_bound(offset);
-        if (next != free_holes.end() && offset + total == next->first) {
-            auto node = free_holes.extract(next); // noexcept
-            new_size += node.mapped();
-            removed.push_back(std::move(node));
-        }
-
-        try {
-            free_holes.emplace(new_offset, new_size);
-        } catch (...) {
-            // Rollback completo: se reinsertan los nodos extraidos (noexcept) y
-            // los contadores no se tocan. El allocator queda como estaba.
-            for (auto & n : removed) {
-                free_holes.insert(std::move(n));
+            size_t new_offset = node.key();
+            size_t new_size   = total + node.mapped();
+            if (merges_next) {
+                // `next` puede haberse invalidado al extraer `prev`; rebuscarlo.
+                auto it2 = free_holes.lower_bound(offset);
+                if (it2 != free_holes.end() && offset + total == it2->first) {
+                    auto node2 = free_holes.extract(it2); // noexcept
+                    new_size += node2.mapped();
+                }
             }
-            return;
+            node.key()    = new_offset;
+            node.mapped() = new_size;
+            free_holes.insert(std::move(node)); // reutiliza el nodo: noexcept
+        } else if (merges_next) {
+            auto node = free_holes.extract(next); // noexcept
+            node.key()    = offset;
+            node.mapped() = total + node.mapped();
+            free_holes.insert(std::move(node)); // noexcept
+        } else {
+            // Hueco completamente nuevo: unica operacion asignadora. Se intenta
+            // antes de tocar contadores; un fallo no modifica nada.
+            if (nexus_test_fail_alloc()) {
+                // inyeccion TEST-ONLY: la insercion del hueco falla deterministamente
+                return false;
+            }
+            try {
+                free_holes.emplace(offset, total);
+            } catch (...) {
+                return false;
+            }
         }
 
         aligned_bytes -= size;
         slack_bytes   -= slack;
         free_bytes    += total;
+        return true;
     }
 
     bool evict_lru_victim() {
@@ -595,7 +629,12 @@ struct llama_expert_source::impl {
                 !blk.needs_proof &&
                 last_confirmed_epoch >= blk.last_fill_epoch) {
 
-                free_block(blk.offset, blk.size, blk.slack);
+                // Solo se despublica el bloque si la liberacion confirmo exito.
+                // Si falla, el bloque, la lista LRU, los indices y los contadores
+                // quedan integros (sin perdida silenciosa de capacidad).
+                if (!free_block(blk.offset, blk.size, blk.slack)) {
+                    return false;
+                }
                 evictions++;
                 evict_bytes += blk.size;
                 evict_slack_bytes += blk.slack;
@@ -968,6 +1007,14 @@ struct llama_expert_source::impl::fill_active_guard {
     }
 };
 
+void llama_expert_source::test_arm_alloc_failure(long long phases) {
+    g_nexus_test_alloc_fail.store(phases, std::memory_order_relaxed);
+}
+
+void llama_expert_source::test_disarm_alloc_failure() {
+    g_nexus_test_alloc_fail.store(-1, std::memory_order_relaxed);
+}
+
 struct llama_expert_create_result llama_expert_source::create(
         const llama_expert_model_meta & meta,
         const config & cfg) {
@@ -1008,8 +1055,15 @@ struct llama_expert_create_result llama_expert_source::create(
         return result;
     }
 
+    try {
+
     p->cfg = cfg;
 
+    // fase asignadora 0: vector de shards
+    if (nexus_test_fail_alloc()) {
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
     p->shards.resize(meta.files.size());
     for (size_t i = 0; i < meta.files.size(); ++i) {
         p->shards[i].path = meta.files[i].path;
@@ -1023,6 +1077,11 @@ struct llama_expert_create_result llama_expert_source::create(
         }
     }
 
+    // fase asignadora 1: copia del mapa de metadatos
+    if (nexus_test_fail_alloc()) {
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
     p->extents = meta.tensors;
 
     // B4: la identidad gate/up vs down viene de metadatos explicitos del tensor
@@ -1035,6 +1094,12 @@ struct llama_expert_create_result llama_expert_source::create(
     };
     std::map<int32_t, layer_expert_bytes> per_layer;
     bool capacity_known = true;
+
+    // fase asignadora 2: estructuras auxiliares de clasificacion/per_layer
+    if (nexus_test_fail_alloc()) {
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
 
     // Bloqueante B: clasificar el modelo antes de decidir. Un candidato MoE con
     // metadatos INVALID no es "ausencia de soporte": es corrupcion y debe
@@ -1169,6 +1234,11 @@ struct llama_expert_create_result llama_expert_source::create(
     p->arena_buf  = nullptr;
     p->mem_kind   = llama_expert_mem_kind::PAGEABLE_HOST;
 
+    // fase asignadora 3: nodo inicial de free_holes
+    if (nexus_test_fail_alloc()) {
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
     p->free_holes[0] = p->arena_bytes;
     p->aligned_bytes = 0;
     p->slack_bytes   = 0;
@@ -1178,10 +1248,24 @@ struct llama_expert_create_result llama_expert_source::create(
         "nexus-expert-stream: L2 single arena initialized: %.2f MiB (alignment: %zu, first-fit coalescing)\n",
         (double) p->arena_bytes / (1024.0 * 1024.0), p->alignment);
 
+    // fase asignadora 4: objeto fuente
+    if (nexus_test_fail_alloc()) {
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
     result.status = llama_expert_create_status::SUCCESS;
     result.source = std::make_unique<llama_expert_source>();
     result.source->pimpl = std::move(p);
     return result;
+    } catch (const std::bad_alloc &) {
+        // p (unique_ptr) se destruye y cierra los shards ya abiertos: no quedan
+        // recursos colgados. Un fallo de memoria nunca se clasifica como IO_ERROR.
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    } catch (...) {
+        result.status = llama_expert_create_status::IO_ERROR;
+        return result;
+    }
 }
 
 llama_expert_source::~llama_expert_source() = default;
@@ -1374,8 +1458,10 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
         // devuelve el hueco y se rechaza el extent en vez de escribir fuera.
         if (alloc_off > p.arena_bytes || alloc_sz > p.arena_bytes - alloc_off ||
             expert_size > alloc_sz) {
-            p.free_block(alloc_off, alloc_sz, alloc_slk);
             p.alloc_fail++;
+            if (!p.free_block(alloc_off, alloc_sz, alloc_slk)) {
+                return llama_expert_fill_status::OUT_OF_MEMORY;
+            }
             return llama_expert_fill_status::INVALID_EXTENT;
         }
 
@@ -1397,7 +1483,10 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
                 // Inalcanzable bajo el mismo mutex (la clave no existia al mirar),
                 // pero se mantiene como red de seguridad: restaurar y continuar.
                 p.l2_lru_list.erase(blk.lru_it);
-                p.free_block(alloc_off, alloc_sz, alloc_slk);
+                p.alloc_fail++;
+                if (!p.free_block(alloc_off, alloc_sz, alloc_slk)) {
+                    return llama_expert_fill_status::OUT_OF_MEMORY;
+                }
                 is_loader = false;
                 lk.unlock();
                 continue;
@@ -1450,7 +1539,14 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
                 std::lock_guard<std::mutex> lk(p.l2_mutex);
                 auto it = p.l2_index.find(key);
                 if (it != p.l2_index.end()) {
-                    p.free_block(it->second.offset, it->second.size, it->second.slack);
+                    if (!p.free_block(it->second.offset, it->second.size, it->second.slack)) {
+                        // No se pudo devolver el hueco (OOM): el bloque se
+                        // conserva marcado INVALID para que los esperadores no lo
+                        // reutilicen, y la contabilidad sigue siendo coherente.
+                        it->second.content = llama_expert_content::INVALID;
+                        p.cv_loading.notify_all();
+                        return llama_expert_fill_status::IO_ERROR;
+                    }
                     p.l2_lru_list.erase(it->second.lru_it);
                     p.l2_index.erase(it);
                 }
