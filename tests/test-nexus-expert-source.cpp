@@ -37,6 +37,68 @@ static int count_open_fds() {
     return n;
 }
 
+static void test_d163_fatal_rollback_propagation() {
+    printf("[TEST] Testing D-1.6.3 fatal rollback propagation and quarantine...\n");
+
+    llama_expert_model_meta meta;
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 4 * 1024 * 1024;
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_d163_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t file_size = 16 * 1024 * 1024;
+    TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+    meta.files.push_back({ temp_path, file_size });
+
+    ggml_tensor t{};
+    t.ne[2] = 8;
+    t.nb[2] = 1024 * 1024;
+    meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 8, true,
+                         0, llama_expert_tensor_role::GATE_UP,
+                         llama_expert_tensor_validation::VALID };
+
+    const size_t MB = 1024 * 1024;
+    ggml_tensor dummy_bank{};
+
+    auto es = llama_expert_source::create(meta, cfg).source;
+    TEST_CHECK(es != nullptr, "create failed");
+
+    // Fallo de publicacion (emplace) + fallo de rollback (restore_alloc):
+    // el rollback imposible debe activar la politica terminal.
+    llama_expert_source::test_arm_alloc_failure(1);    // emplace lanza bad_alloc
+    llama_expert_source::test_arm_restore_failure(-2); // restore_alloc falla siempre
+    auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, MB);
+    llama_expert_source::test_disarm_alloc_failure();
+    llama_expert_source::test_disarm_restore_failure();
+
+    // 1. El resultado es IO_ERROR (nunca OUT_OF_MEMORY recuperable).
+    TEST_CHECK(st == llama_expert_fill_status::IO_ERROR,
+               "a failed rollback must propagate IO_ERROR, not OOM");
+
+    // 2. La arena quedo en cuarentena (retirada, no liberada).
+    TEST_CHECK(es->was_arena_quarantined(),
+               "the arena must be quarantined after a failed rollback");
+
+    // 3. Las llamadas posteriores son rechazadas (fuente fatal).
+    auto st2 = es->fill_expert(nullptr, &dummy_bank, 0, &t, 1, 0, MB);
+    TEST_CHECK(st2 == llama_expert_fill_status::IO_ERROR,
+               "a fill after a fatal rollback must be rejected");
+    auto st3 = es->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, MB);
+    TEST_CHECK(st3 == llama_expert_fill_status::IO_ERROR,
+               "even a hit after a fatal rollback must be rejected");
+
+    // 4. La destruccion no libera la arena (cuarentena): sin doble free.
+    es.reset(); // no debe abortar ni liberar la memoria en cuarentena
+
+    // El proceso sigue vivo: no se invoco std::_Exit().
+    printf("[PASS] D-1.6.3 fatal rollback propagation passed.\n");
+
+    close(fd);
+    unlink(temp_path);
+}
+
 static void test_d162_publication_rollback() {
     printf("[TEST] Testing D-1.6.2 publication rollback after allocation failures...\n");
 
@@ -1814,6 +1876,7 @@ int main() {
 #if defined(GGML_NEXUS_TEST_HOOKS)
     test_d161_transactional_allocator();
     test_d162_publication_rollback();
+    test_d163_fatal_rollback_propagation();
 #endif
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();
