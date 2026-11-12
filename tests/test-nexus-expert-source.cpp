@@ -1152,6 +1152,95 @@ static void test_b5_statistics() {
     printf("[PASS] B5 statistics accounting and reset passed.\n");
 }
 
+static void test_blocker_c_alignment_transaction() {
+    printf("[TEST] Testing blocker C/D: arena alignment substitution is transactional...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_dev == nullptr) {
+        gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+    }
+    if (gpu_dev == nullptr) {
+        printf("[SKIP] no GPU/iGPU backend: arena substitution not exercised in this build\n");
+        return;
+    }
+    ggml_backend_t vk = ggml_backend_dev_init(gpu_dev, nullptr);
+    TEST_CHECK(vk != nullptr, "failed to init the GPU backend");
+    const char * vk_name = ggml_backend_name(vk);
+    if (vk_name == nullptr || strstr(vk_name, "Vulkan") == nullptr) {
+        printf("[SKIP] the GPU backend is not Vulkan (%s)\n", vk_name ? vk_name : "unknown");
+        ggml_backend_free(vk);
+        return;
+    }
+
+    const size_t expert_bytes = 1024 * 1024;
+    char temp_path[] = "/tmp/test_nexus_c_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t file_size = 4 * expert_bytes;
+    TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+
+    llama_expert_model_meta meta;
+    meta.files.push_back({ temp_path, file_size });
+    ggml_tensor t{};
+    t.ne[2] = 4;
+    t.nb[2] = expert_bytes;
+    meta.tensors[&t] = { 0, 0, expert_bytes, expert_bytes, 4, true };
+
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 2 * expert_bytes;
+    cfg.alignment      = 64;
+
+    auto exsrc = llama_expert_source::create(meta, cfg).source;
+    TEST_CHECK(exsrc != nullptr, "create failed");
+    TEST_CHECK(exsrc->get_effective_alignment() == 64,
+               "the allocator must start with the configured alignment");
+    TEST_CHECK(exsrc->get_l2_mem_kind() == llama_expert_mem_kind::PAGEABLE_HOST,
+               "before any backend bind the arena must be PAGEABLE_HOST");
+
+    ggml_backend_buffer_type_t dev_buft = ggml_backend_get_default_buffer_type(vk);
+    ggml_backend_buffer_t bank_buf = ggml_backend_buft_alloc_buffer(dev_buft, 2 * expert_bytes);
+    TEST_CHECK(bank_buf != nullptr, "failed to allocate the device bank");
+    ggml_tensor bank = make_test_bank(bank_buf, 2 * expert_bytes);
+
+    // El primer fill enlaza el backend y dispara la sustitucion transaccional.
+    auto st = exsrc->fill_expert(vk, &bank, 0, &t, 0, 0, expert_bytes);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill through Vulkan failed");
+
+    // La alineacion activa debe ser valida y coherente con la memoria real.
+    const size_t eff = exsrc->get_effective_alignment();
+    TEST_CHECK(eff != 0 && (eff & (eff - 1)) == 0 && eff % sizeof(void *) == 0,
+               "the effective alignment must remain a valid power of two");
+    TEST_CHECK(eff >= 64, "the effective alignment must never be smaller than the base");
+    const auto kind = exsrc->get_l2_mem_kind();
+    TEST_CHECK(kind == llama_expert_mem_kind::PINNED_VK ||
+               kind == llama_expert_mem_kind::PAGEABLE_HOST_FALLBACK ||
+               kind == llama_expert_mem_kind::PAGEABLE_HOST,
+               "the memory classification must be honest");
+
+    // El allocator sigue funcional: un segundo fill escribe en la arena activa.
+    st = exsrc->fill_expert(vk, &bank, 0, &t, 1, expert_bytes, expert_bytes);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "second fill on the substituted arena failed");
+    TEST_CHECK(exsrc->get_arena_stats().blocks_live.load() == 2,
+               "both blocks must live in the active arena");
+
+    // Invariante del allocator intacto.
+    const auto & s = exsrc->get_arena_stats();
+    TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+               "arena invariant violated after substitution");
+
+    // Teardown limpio: no doble liberacion.
+    exsrc->drain();
+    TEST_CHECK(!exsrc->was_arena_quarantined(), "drain after substitution must free the arena");
+    exsrc.reset();
+
+    ggml_backend_buffer_free(bank_buf);
+    ggml_backend_free(vk);
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] Blocker C arena alignment substitution passed.\n");
+}
+
 static void test_callback_sync_vulkan() {
     printf("[TEST] Testing CALLBACK_SYNC with a real Vulkan backend...\n");
 
@@ -1349,6 +1438,7 @@ int main() {
     test_concurrency_and_barrier_quiescence();
     test_blocker_a_concurrent_same_key();
     test_blocker_b_create_statuses();
+    test_blocker_c_alignment_transaction();
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();
     test_b2_sync_modes_and_teardown();

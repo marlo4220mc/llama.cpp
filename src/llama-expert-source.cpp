@@ -434,45 +434,44 @@ struct llama_expert_source::impl {
             if (dev) {
                 ggml_backend_buffer_type_t expected_buft = ggml_backend_dev_host_buffer_type(dev);
                 if (expected_buft != nullptr && expected_buft == ggml_backend_vk_host_buffer_type()) {
-                    const size_t required_alignment = ggml_backend_buft_get_alignment(expected_buft);
-                    if (required_alignment == 0 ||
-                        (required_alignment & (required_alignment - 1)) != 0 ||
-                        required_alignment % sizeof(void *) != 0) {
-                        LLAMA_LOG_ERROR("nexus-expert-stream: invalid effective host-buffer alignment: %zu\n",
-                                required_alignment);
-                        return;
-                    }
-                    if (required_alignment > alignment) {
-                        // Todavia no hay bloques: se puede cambiar la alineacion
-                        // del allocator antes de aceptar el primer fill.
-                        alignment = required_alignment;
-                    }
+                    // Bloqueante C: la alineacion activa NO se modifica hasta que
+                    // la reserva nueva este confirmada y comprometida. Cualquier
+                    // fallo conserva la arena posix original, su alineacion y su
+                    // clasificacion de memoria honesta.
                     ggml_backend_buffer_t vk_buf = ggml_backend_buft_alloc_buffer(expected_buft, arena_bytes);
                     if (vk_buf != nullptr) {
+                        // Bloqueante D: durante esta ventana existen dos reservas
+                        // completas (posix + Vulkan). Es el pico transitorio de la
+                        // sustitucion transaccional: no se libera la arena activa
+                        // antes de tener una nueva validada. Pico = 2 * arena_bytes.
                         ggml_backend_buffer_type_t effective_buft = ggml_backend_buffer_get_type(vk_buf);
                         const size_t effective_alignment = ggml_backend_buffer_get_alignment(vk_buf);
                         void * new_base = ggml_backend_buffer_get_base(vk_buf);
                         if (effective_alignment == 0 ||
                             (effective_alignment & (effective_alignment - 1)) != 0 ||
-                            effective_alignment % sizeof(void *) != 0) {
-                            LLAMA_LOG_ERROR("nexus-expert-stream: invalid allocated-buffer alignment: %zu\n",
-                                    effective_alignment);
+                            effective_alignment % sizeof(void *) != 0 ||
+                            new_base == nullptr) {
+                            LLAMA_LOG_ERROR("nexus-expert-stream: invalid allocated Vulkan buffer (alignment %zu, base %p), "
+                                            "keeping the pageable arena\n", effective_alignment, (void *) new_base);
                             ggml_backend_buffer_free(vk_buf);
                             return;
                         }
-                        alignment = std::max(alignment, effective_alignment);
-                        if (effective_buft == expected_buft && new_base != nullptr) {
-                            // Escenario 1: PINNED_VK exitoso
+                        if (effective_buft == expected_buft) {
+                            // Escenario 1: PINNED_VK exitoso. Se adopta la alineacion
+                            // del buffer nuevo y se libera la reserva anterior.
                             if (owns_arena && arena_base) {
                                 free(arena_base);
                             }
                             arena_buf   = vk_buf;
                             arena_base  = new_base;
                             owns_arena  = false;
+                            alignment   = effective_alignment;
                             mem_kind    = llama_expert_mem_kind::PINNED_VK;
-                            LLAMA_LOG_INFO("nexus-expert-stream: upgraded to PINNED_VK host buffer (%zu bytes)\n", arena_bytes);
+                            LLAMA_LOG_INFO("nexus-expert-stream: upgraded to PINNED_VK host buffer (%zu bytes, alignment %zu)\n",
+                                    arena_bytes, alignment);
                             return;
-                        } else if (effective_buft == ggml_backend_cpu_buffer_type() && new_base != nullptr) {
+                        }
+                        if (effective_buft == ggml_backend_cpu_buffer_type()) {
                             // Escenario 2: PAGEABLE_HOST_FALLBACK devuelto por Vulkan
                             if (owns_arena && arena_base) {
                                 free(arena_base);
@@ -480,14 +479,20 @@ struct llama_expert_source::impl {
                             arena_buf   = vk_buf;
                             arena_base  = new_base;
                             owns_arena  = false;
+                            alignment   = effective_alignment;
                             mem_kind    = llama_expert_mem_kind::PAGEABLE_HOST_FALLBACK;
-                            LLAMA_LOG_WARN("nexus-expert-stream: Vulkan returned CPU fallback buffer (PAGEABLE_HOST_FALLBACK)\n");
+                            LLAMA_LOG_WARN("nexus-expert-stream: Vulkan returned CPU fallback buffer (PAGEABLE_HOST_FALLBACK, alignment %zu)\n",
+                                    alignment);
                             return;
-                        } else {
-                            // Buffer devuelto no soportado / desconocido -> rechazar y liberar
-                            LLAMA_LOG_ERROR("nexus-expert-stream: unsupported buffer type returned by Vulkan, rejecting\n");
-                            ggml_backend_buffer_free(vk_buf);
                         }
+                        // Buffer devuelto no soportado / desconocido -> rechazar y
+                        // conservar la reserva y alineacion originales.
+                        LLAMA_LOG_ERROR("nexus-expert-stream: unsupported buffer type returned by Vulkan, "
+                                        "keeping the pageable arena\n");
+                        ggml_backend_buffer_free(vk_buf);
+                    } else {
+                        LLAMA_LOG_ERROR("nexus-expert-stream: Vulkan host buffer allocation failed, "
+                                        "keeping the pageable arena\n");
                     }
                 }
             }
@@ -1671,6 +1676,10 @@ size_t llama_expert_source::get_l2_capacity_pairs() const {
 size_t llama_expert_source::get_l2_block_count() const {
     std::lock_guard<std::mutex> lk(pimpl->l2_mutex);
     return pimpl->l2_index.size();
+}
+
+size_t llama_expert_source::get_effective_alignment() const {
+    return pimpl->alignment;
 }
 
 size_t llama_expert_source::get_arena_bytes() const {

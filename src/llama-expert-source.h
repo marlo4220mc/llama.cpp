@@ -272,6 +272,7 @@ public:
     size_t get_l2_capacity_pairs() const; // desde los roles/capas explicitos; 0 = desconocida, nunca fijado a 320
     size_t get_l2_block_count() const;
     size_t get_arena_bytes() const;
+    size_t get_effective_alignment() const;
     llama_expert_mem_kind get_l2_mem_kind() const;
 
 private:
