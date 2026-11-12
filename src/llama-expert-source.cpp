@@ -231,11 +231,12 @@ struct process_arena_quarantine {
 
 static process_arena_quarantine g_arena_quarantine;
 
-// Gancho de inyeccion de fallos TEST-ONLY. Cuando g_nexus_test_alloc_fail >= 0,
-// cada fase asignadora que lo consulta consume una unidad; la fase que llega a
-// 0 falla con OUT_OF_MEMORY (o devuelve false en el allocator). -1 (default)
-// desactiva el gancho. No afecta al funcionamiento normal ni a los hilos
-// productivos (solo las pruebas lo arman).
+#if defined(GGML_NEXUS_TEST_HOOKS)
+// Gancho de inyeccion de fallos TEST-ONLY, compilado SOLO cuando la opcion
+// LLAMA_NEXUS_TEST_HOOKS esta activa. En produccion no existe ni esta rama ni
+// el atomic global, por lo que el allocator no tiene lecturas extra. Un valor
+// >= 0 hace fallar la fase asignadora numero `phases`; -2 = fallar siempre
+// hasta desarmar; -1 = desarmado.
 static std::atomic<long long> g_nexus_test_alloc_fail{-1};
 
 static bool nexus_test_fail_alloc() noexcept {
@@ -249,6 +250,7 @@ static bool nexus_test_fail_alloc() noexcept {
     }
     return g_nexus_test_alloc_fail.fetch_sub(1, std::memory_order_relaxed) == 0;
 }
+#endif // GGML_NEXUS_TEST_HOOKS
 
 } // namespace
 
@@ -569,6 +571,11 @@ struct llama_expert_source::impl {
     //   - caso de hueco nuevo: la unica operacion asignadora se intenta antes de
     //     tocar nada; si falla, no se modifica ni free_holes ni los contadores.
     bool free_block(size_t offset, size_t size, size_t slack) {
+        // Proteccion contra overflow: size y slack provienen de bloques vivos,
+        // pero se audita explicitamente antes de sumar.
+        if (size > SIZE_MAX - slack) {
+            return false;
+        }
         size_t total = size + slack;
 
         auto next = free_holes.lower_bound(offset);
@@ -578,6 +585,9 @@ struct llama_expert_source::impl {
         const bool merges_next = next != free_holes.end() && offset + total == next->first;
 
         if (merges_prev) {
+            // Comparador y nodos de std::map<size_t,size_t>: std::less<size_t> no
+            // puede lanzar, y extract()/insert(node_type&&) son noexcept. Reusar
+            // el nodo extraido evita cualquier asignacion despues del extract.
             auto node = free_holes.extract(prev); // noexcept
             size_t new_offset = node.key();
             size_t new_size   = total + node.mapped();
@@ -591,7 +601,7 @@ struct llama_expert_source::impl {
             }
             node.key()    = new_offset;
             node.mapped() = new_size;
-            free_holes.insert(std::move(node)); // reutiliza el nodo: noexcept
+            free_holes.insert(std::move(node)); // noexcept: reutiliza el nodo
         } else if (merges_next) {
             auto node = free_holes.extract(next); // noexcept
             node.key()    = offset;
@@ -600,11 +610,17 @@ struct llama_expert_source::impl {
         } else {
             // Hueco completamente nuevo: unica operacion asignadora. Se intenta
             // antes de tocar contadores; un fallo no modifica nada.
-            if (nexus_test_fail_alloc()) {
-                // inyeccion TEST-ONLY: la insercion del hueco falla deterministamente
-                return false;
-            }
             try {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+                // inyeccion TEST-ONLY: el bad_alloc real se lanza DENTRO del try,
+                // de modo que el catch de produccion se ejecuta de verdad. NOTA:
+                // esto ejercita el manejador de excepciones, no demuestra que
+                // std::map::emplace en si lance bad_alloc (para eso haria falta
+                // un allocator de prueba en el tipo del mapa).
+                if (nexus_test_fail_alloc()) {
+                    throw std::bad_alloc();
+                }
+#endif
                 free_holes.emplace(offset, total);
             } catch (...) {
                 return false;
@@ -1007,6 +1023,7 @@ struct llama_expert_source::impl::fill_active_guard {
     }
 };
 
+#if defined(GGML_NEXUS_TEST_HOOKS)
 void llama_expert_source::test_arm_alloc_failure(long long phases) {
     g_nexus_test_alloc_fail.store(phases, std::memory_order_relaxed);
 }
@@ -1014,6 +1031,12 @@ void llama_expert_source::test_arm_alloc_failure(long long phases) {
 void llama_expert_source::test_disarm_alloc_failure() {
     g_nexus_test_alloc_fail.store(-1, std::memory_order_relaxed);
 }
+
+bool llama_expert_source::test_free_block(size_t offset, size_t size, size_t slack) {
+    std::lock_guard<std::mutex> lk(pimpl->l2_mutex);
+    return pimpl->free_block(offset, size, slack);
+}
+#endif // GGML_NEXUS_TEST_HOOKS
 
 struct llama_expert_create_result llama_expert_source::create(
         const llama_expert_model_meta & meta,
@@ -1060,10 +1083,11 @@ struct llama_expert_create_result llama_expert_source::create(
     p->cfg = cfg;
 
     // fase asignadora 0: vector de shards
+#if defined(GGML_NEXUS_TEST_HOOKS)
     if (nexus_test_fail_alloc()) {
-        result.status = llama_expert_create_status::OUT_OF_MEMORY;
-        return result;
+        throw std::bad_alloc();
     }
+#endif
     p->shards.resize(meta.files.size());
     for (size_t i = 0; i < meta.files.size(); ++i) {
         p->shards[i].path = meta.files[i].path;
@@ -1078,10 +1102,11 @@ struct llama_expert_create_result llama_expert_source::create(
     }
 
     // fase asignadora 1: copia del mapa de metadatos
+#if defined(GGML_NEXUS_TEST_HOOKS)
     if (nexus_test_fail_alloc()) {
-        result.status = llama_expert_create_status::OUT_OF_MEMORY;
-        return result;
+        throw std::bad_alloc();
     }
+#endif
     p->extents = meta.tensors;
 
     // B4: la identidad gate/up vs down viene de metadatos explicitos del tensor
@@ -1096,10 +1121,11 @@ struct llama_expert_create_result llama_expert_source::create(
     bool capacity_known = true;
 
     // fase asignadora 2: estructuras auxiliares de clasificacion/per_layer
+#if defined(GGML_NEXUS_TEST_HOOKS)
     if (nexus_test_fail_alloc()) {
-        result.status = llama_expert_create_status::OUT_OF_MEMORY;
-        return result;
+        throw std::bad_alloc();
     }
+#endif
 
     // Bloqueante B: clasificar el modelo antes de decidir. Un candidato MoE con
     // metadatos INVALID no es "ausencia de soporte": es corrupcion y debe
@@ -1235,10 +1261,11 @@ struct llama_expert_create_result llama_expert_source::create(
     p->mem_kind   = llama_expert_mem_kind::PAGEABLE_HOST;
 
     // fase asignadora 3: nodo inicial de free_holes
+#if defined(GGML_NEXUS_TEST_HOOKS)
     if (nexus_test_fail_alloc()) {
-        result.status = llama_expert_create_status::OUT_OF_MEMORY;
-        return result;
+        throw std::bad_alloc();
     }
+#endif
     p->free_holes[0] = p->arena_bytes;
     p->aligned_bytes = 0;
     p->slack_bytes   = 0;
@@ -1249,10 +1276,11 @@ struct llama_expert_create_result llama_expert_source::create(
         (double) p->arena_bytes / (1024.0 * 1024.0), p->alignment);
 
     // fase asignadora 4: objeto fuente
+#if defined(GGML_NEXUS_TEST_HOOKS)
     if (nexus_test_fail_alloc()) {
-        result.status = llama_expert_create_status::OUT_OF_MEMORY;
-        return result;
+        throw std::bad_alloc();
     }
+#endif
     result.status = llama_expert_create_status::SUCCESS;
     result.source = std::make_unique<llama_expert_source>();
     result.source->pimpl = std::move(p);

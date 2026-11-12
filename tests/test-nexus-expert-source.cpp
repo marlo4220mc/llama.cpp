@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <string>
 #include <thread>
@@ -20,104 +21,193 @@
         } \
     } while (0)
 
-static void test_d16_alloc_failure_injection() {
-    printf("[TEST] Testing D-1.6 deterministic allocation-failure injection...\n");
+#if defined(GGML_NEXUS_TEST_HOOKS)
+// Conteo de descriptores abiertos (Linux): se usa para verificar que create()
+// no deje shard fds abiertos al fallar cada fase.
+static int count_open_fds() {
+    int n = 0;
+    DIR * d = opendir("/proc/self/fd");
+    if (d == nullptr) {
+        return -1;
+    }
+    while (readdir(d) != nullptr) {
+        ++n;
+    }
+    closedir(d);
+    return n;
+}
 
-    // --- 1. Eviction con fallo de liberacion: free_block devuelve false y el
-    // bloque victimizado se conserva integro (indices, LRU, contadores).
-    {
-        llama_expert_model_meta meta;
-        llama_expert_source::config cfg;
-        cfg.ram_warm_bytes = 4 * 1024 * 1024;
-        cfg.alignment      = 64;
+static void test_d161_transactional_allocator() {
+    printf("[TEST] Testing D-1.6.1 transactional allocator and real bad_alloc paths...\n");
 
-        char temp_path[] = "/tmp/test_nexus_d16_XXXXXX";
-        int fd = mkstemp(temp_path);
-        TEST_CHECK(fd >= 0, "mkstemp failed");
-        const size_t file_size = 16 * 1024 * 1024;
-        TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
-        meta.files.push_back({ temp_path, file_size });
+    llama_expert_model_meta meta;
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 4 * 1024 * 1024;
+    cfg.alignment      = 64;
 
-        ggml_tensor t{};
-        t.ne[2] = 8;
-        t.nb[2] = 1024 * 1024;
-        meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 8, true };
+    char temp_path[] = "/tmp/test_nexus_d161_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t file_size = 16 * 1024 * 1024;
+    TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+    meta.files.push_back({ temp_path, file_size });
 
-        auto exsrc = llama_expert_source::create(meta, cfg).source;
-        TEST_CHECK(exsrc != nullptr, "create failed");
-        ggml_tensor dummy_bank{};
+    ggml_tensor t{};
+    t.ne[2] = 8;
+    t.nb[2] = 1024 * 1024;
+    meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 8, true,
+                         0, llama_expert_tensor_role::GATE_UP,
+                         llama_expert_tensor_validation::VALID };
 
-        // Llenar la arena por completo: 4 expertos de 1 MiB, sin huecos.
+    ggml_tensor dummy_bank{};
+    const size_t MB = 1024 * 1024;
+
+    auto fill_all = [&](llama_expert_source * es) {
         for (int e = 0; e < 4; ++e) {
-            auto st = exsrc->fill_expert(nullptr, &dummy_bank, 0, &t, e, 0, 1024 * 1024);
+            auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, e, 0, MB);
             TEST_CHECK(st == llama_expert_fill_status::LOADED, "arena fill failed");
         }
-        // Liberar los pins de la capa 0 para que los bloques sean evictables.
-        exsrc->on_layer_synchronized(0);
-        TEST_CHECK(exsrc->get_arena_stats().blocks_live.load() == 4, "arena must be full");
+        const auto & s = es->get_arena_stats();
+        TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+                   "invariant must hold after filling");
+    };
 
-        // La arena esta llena (sin huecos): la eviction del bloque LRU-rear
-        // pasa por el caso de "hueco nuevo" de free_block. Armar el modo
-        // "fallar siempre" hace que TODOS los intentos de liberacion fallen
-        // (el bucle de la ruta de miss reintenta una vez tras la barrera), de
-        // modo que la eviction aborta y el bloque se conserva.
-        llama_expert_source::test_arm_alloc_failure(-2);
-        auto st = exsrc->fill_expert(nullptr, &dummy_bank, 0, &t, 4, 0, 1024 * 1024);
+    // 1. Fallo al insertar un hueco SIN vecinos: el bad_alloc se lanza dentro
+    // del try, lo captura el catch real y free_block devuelve false sin tocar
+    // contadores ni el mapa. Recuperacion inmediata.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        fill_all(es.get());
+
+        llama_expert_source::test_arm_alloc_failure(0);
+        bool ok = es->test_free_block(0, MB, 0);
+        llama_expert_source::test_disarm_alloc_failure();
+        TEST_CHECK(!ok, "fresh-hole insertion failure must return false");
+        const auto & s = es->get_arena_stats();
+        TEST_CHECK(s.free_bytes.load() == 0 && s.aligned_bytes.load() == 4 * MB,
+                   "a failed fresh-hole insert must not change counters");
+        TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+                   "invariant must hold after the failed fresh-hole insert");
+        TEST_CHECK(es->test_free_block(0, MB, 0),
+                   "the allocator must recover after a failed fresh-hole insert");
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == MB,
+                   "recovery must account the freed block");
+        es->drain();
+        es.reset();
+    }
+
+    // 2. Fusion con el vecino ANTERIOR (hueco {0:1MiB}, bloques 1,2,3 vivos):
+    // liberar el bloque 1 fusiona con su hueco previo.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        fill_all(es.get());
+        TEST_CHECK(es->test_free_block(0, MB, 0), "free block 0 (left hole)");
+        TEST_CHECK(es->test_free_block(1 * MB, MB, 0),
+                   "block 1 must merge with its previous hole");
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == 2 * MB,
+                   "prev merge must recover exactly 2 MiB");
+        const auto & s = es->get_arena_stats();
+        TEST_CHECK(s.aligned_bytes.load() == 2 * MB,
+                   "prev merge must leave 2 MiB allocated");
+        TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+                   "invariant after prev merge");
+        es->drain();
+        es.reset();
+    }
+
+    // 3. Fusion con el vecino SIGUIENTE (hueco {3:1MiB}, bloques 0,1,2 vivos):
+    // liberar el bloque 2 fusiona con su hueco siguiente.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        fill_all(es.get());
+        TEST_CHECK(es->test_free_block(3 * MB, MB, 0), "free block 3 (right hole)");
+        TEST_CHECK(es->test_free_block(2 * MB, MB, 0),
+                   "block 2 must merge with its next hole");
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == 2 * MB,
+                   "next merge must recover exactly 2 MiB");
+        const auto & s = es->get_arena_stats();
+        TEST_CHECK(s.aligned_bytes.load() == 2 * MB,
+                   "next merge must leave 2 MiB allocated");
+        TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+                   "invariant after next merge");
+        es->drain();
+        es.reset();
+    }
+
+    // 4. Fusion SIMULTANEA con ambos vecinos (huecos {1:1MiB} y {3:1MiB},
+    // bloque 2 vivo en [2,3MiB)): liberar el bloque 2 fusiona con los dos.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        fill_all(es.get());
+        TEST_CHECK(es->test_free_block(1 * MB, MB, 0), "free block 1 (left hole)");
+        TEST_CHECK(es->test_free_block(3 * MB, MB, 0), "free block 3 (right hole)");
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == 2 * MB,
+                   "two fresh holes before the both-merge");
+        TEST_CHECK(es->test_free_block(2 * MB, MB, 0),
+                   "block 2 must merge with BOTH neighbors");
+        const auto & s = es->get_arena_stats();
+        TEST_CHECK(s.free_bytes.load() == 3 * MB,
+                   "both merge must recover exactly 3 MiB");
+        TEST_CHECK(s.aligned_bytes.load() == 1 * MB,
+                   "both merge must leave the first block allocated");
+        TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+                   "invariant after both merge");
+        es->drain();
+        es.reset();
+    }
+
+    // --- Eviction con fallo de liberacion: free_block devuelve false y el
+    // bloque victimizado se conserva integro (indices, LRU, contadores). ---
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        fill_all(es.get());
+        es->on_layer_synchronized(0);
+        TEST_CHECK(es->get_arena_stats().blocks_live.load() == 4, "arena must be full");
+
+        llama_expert_source::test_arm_alloc_failure(-2); // fallar siempre
+        auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 4, 0, MB);
         llama_expert_source::test_disarm_alloc_failure();
 
         TEST_CHECK(st == llama_expert_fill_status::OUT_OF_MEMORY,
                    "a failed eviction must surface as OUT_OF_MEMORY");
-        TEST_CHECK(exsrc->get_arena_stats().blocks_live.load() == 4,
+        TEST_CHECK(es->get_arena_stats().blocks_live.load() == 4,
                    "the failed eviction must not despublicar a block");
-        TEST_CHECK(exsrc->get_arena_stats().evictions.load() == 0,
+        TEST_CHECK(es->get_arena_stats().evictions.load() == 0,
                    "no eviction may be counted when the free failed");
 
         llama_expert_key victim{ 0, reinterpret_cast<uintptr_t>(&t), 0 };
         llama_expert_block_info bi{};
-        TEST_CHECK(exsrc->get_block_info(victim, bi),
+        TEST_CHECK(es->get_block_info(victim, bi),
                    "the LRU-rear victim must still be indexed");
-        const auto & s = exsrc->get_arena_stats();
+        const auto & s = es->get_arena_stats();
         TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
                    "invariant must hold after the failed eviction");
 
         // El allocator sigue usable: una nueva llamada evicta de verdad.
-        st = exsrc->fill_expert(nullptr, &dummy_bank, 0, &t, 4, 0, 1024 * 1024);
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 4, 0, MB);
         TEST_CHECK(st == llama_expert_fill_status::LOADED, "the allocator must keep working");
-        TEST_CHECK(exsrc->get_arena_stats().evictions.load() == 1, "the real eviction must be counted");
+        TEST_CHECK(es->get_arena_stats().evictions.load() == 1, "the real eviction must be counted");
 
-        exsrc->drain();
-        exsrc.reset();
-        close(fd);
-        unlink(temp_path);
+        es->drain();
+        TEST_CHECK(!es->was_arena_quarantined(), "drain after the tests must free the arena");
+        es.reset();
     }
 
-    // --- 2. create(): barrido de presupuesto. Cada fase asignadora, cuando
-    // falla, debe devolver OUT_OF_MEMORY (nunca lanzar, nunca INVALID/IO para
-    // metadatos validos) y, cuando llega a SUCCESS, la fuente debe funcionar.
+    // --- create(): cada fase asignadora lanza std::bad_alloc real dentro del
+    // try y el catch exterior lo convierte en OUT_OF_MEMORY; nunca INVALID/IO;
+    // sin fugas de descriptores. ---
     {
-        llama_expert_model_meta meta;
-        char temp_path[] = "/tmp/test_nexus_d16c_XXXXXX";
-        int fd = mkstemp(temp_path);
-        TEST_CHECK(fd >= 0, "mkstemp failed");
-        const size_t file_size = 16 * 1024 * 1024;
-        TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
-        meta.files.push_back({ temp_path, file_size });
+        const int fds_before = count_open_fds();
+        TEST_CHECK(fds_before >= 0, "failed to count fds");
 
-        ggml_tensor t{};
-        t.ne[2] = 8;
-        t.nb[2] = 1024 * 1024;
-        meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 8, true,
-                             0, llama_expert_tensor_role::GATE_UP,
-                             llama_expert_tensor_validation::VALID };
-
-        llama_expert_source::config cfg;
-        cfg.ram_warm_bytes = 4 * 1024 * 1024;
-        cfg.alignment      = 64;
-
-        bool saw_oom  = false;
-        bool saw_ok   = false;
-        // Hay 5 fases asignadoras en create(); un presupuesto >= 5 deja pasar
-        // todas y debe devolver SUCCESS.
+        bool saw_oom = false;
+        bool saw_ok  = false;
+        // 5 fases asignadoras; phase 0..4 falla, phase >= 5 debe triunfar.
         for (long long phase = 0; phase <= 8; ++phase) {
             llama_expert_source::test_arm_alloc_failure(phase);
             auto res = llama_expert_source::create(meta, cfg);
@@ -129,8 +219,8 @@ static void test_d16_alloc_failure_injection() {
             } else if (res.status == llama_expert_create_status::SUCCESS) {
                 saw_ok = true;
                 TEST_CHECK(res.source != nullptr, "successful create must own a source");
-                ggml_tensor dummy_bank{};
-                auto st = res.source->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, 1024 * 1024);
+                ggml_tensor b{};
+                auto st = res.source->fill_expert(nullptr, &b, 0, &t, 0, 0, MB);
                 TEST_CHECK(st == llama_expert_fill_status::LOADED,
                            "a source built under a tight budget must still work");
                 res.source->drain();
@@ -142,12 +232,25 @@ static void test_d16_alloc_failure_injection() {
         TEST_CHECK(saw_oom, "some allocation phase must fail within the budget range");
         TEST_CHECK(saw_ok, "a sufficient budget must succeed");
 
-        close(fd);
-        unlink(temp_path);
+        // Un fallo de memoria nunca se clasifica como INVALID_METADATA ni IO_ERROR.
+        for (long long phase = 0; phase <= 4; ++phase) {
+            llama_expert_source::test_arm_alloc_failure(phase);
+            auto res = llama_expert_source::create(meta, cfg);
+            llama_expert_source::test_disarm_alloc_failure();
+            TEST_CHECK(res.status == llama_expert_create_status::OUT_OF_MEMORY,
+                       "a memory failure must be classified as OUT_OF_MEMORY");
+        }
+
+        const int fds_after = count_open_fds();
+        TEST_CHECK(fds_after == fds_before,
+                   "no shard descriptor may leak when create() fails");
     }
 
-    printf("[PASS] D-1.6 allocation-failure injection passed.\n");
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] D-1.6.1 transactional allocator passed.\n");
 }
+#endif // GGML_NEXUS_TEST_HOOKS
 
 static void test_pread_full() {
     printf("[TEST] Testing llama_expert_pread_full robustness...\n");
@@ -1568,7 +1671,9 @@ int main() {
     test_blocker_a_concurrent_same_key();
     test_blocker_b_create_statuses();
     test_blocker_c_alignment_transaction();
-    test_d16_alloc_failure_injection();
+#if defined(GGML_NEXUS_TEST_HOOKS)
+    test_d161_transactional_allocator();
+#endif
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();
     test_b2_sync_modes_and_teardown();

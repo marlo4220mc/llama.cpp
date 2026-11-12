@@ -275,11 +275,16 @@ public:
     size_t get_effective_alignment() const;
     llama_expert_mem_kind get_l2_mem_kind() const;
 
-    // TEST-ONLY: arma el gancho de inyeccion de fallos del allocator. Un valor
-    // phases >= 0 hace fallar la fase asignadora numero `phases` (0 = la
-    // siguiente). -1 (o test_disarm_alloc_failure) desactiva el gancho.
+#if defined(GGML_NEXUS_TEST_HOOKS)
+    // TEST-ONLY (compilado solo con LLAMA_NEXUS_TEST_HOOKS, fuera de produccion):
+    //   test_arm_alloc_failure(phases): phases >= 0 falla la fase asignadora
+    //     numero `phases` (0 = la siguiente); -2 falla siempre hasta desarmar.
+    //   test_free_block: invoca free_block() directamente para pruebas de
+    //     fusion prev/siguiente/ambos.
     static void test_arm_alloc_failure(long long phases);
     static void test_disarm_alloc_failure();
+    bool test_free_block(size_t offset, size_t size, size_t slack);
+#endif
 
 private:
     struct impl;
