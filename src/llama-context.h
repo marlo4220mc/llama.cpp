@@ -332,8 +332,10 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
-    llama_moe_cache_ptr moe_cache;
+    // expert_source se declara antes que moe_cache para que el cache (que solo
+    // lo referencia durante el compute) se destruya primero.
     std::unique_ptr<llama_expert_source> expert_source;
+    llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

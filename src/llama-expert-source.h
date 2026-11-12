@@ -194,6 +194,19 @@ public:
     // Ejecuta el contrato de seis pasos de §2.5.1.
     void synchronize_all();
 
+    // Confirmacion en dos fases de las transferencias programadas en el backend
+    // enlazado, cuando la sincronizacion la hace el consumidor (p. ej. el MoE
+    // cache antes de leer el slot map):
+    //   begin_sync(): cierra la compuerta y espera a que ninguna hebra este
+    //                 programando una transferencia; toma una instantanea del epoch.
+    //   <el llamante ejecuta ggml_backend_synchronize() en el backend enlazado>
+    //   end_sync()  : confirma las transferencias cubiertas por esa sincronizacion
+    //                 y reabre la compuerta.
+    // Si begin_sync() no puede cerrar la compuerta (teardown/abort/fail-stop),
+    // end_sync() no confirma nada.
+    void begin_sync();
+    void end_sync();
+
     const llama_expert_stats & get_stats() const;
     const llama_expert_arena_stats & get_arena_stats() const;
 

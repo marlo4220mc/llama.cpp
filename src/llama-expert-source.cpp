@@ -235,12 +235,15 @@ struct llama_expert_source::impl {
     bool     gate_closed       = false;
     uint64_t gate_epoch        = 0;
     int      programming_fills = 0;
-    int      parked_fills      = 0;
     int      active_fills      = 0;
     bool     barrier_active    = false;
     bool     teardown          = false;
     bool     aborted           = false;
     bool     frozen            = false;
+
+    // Confirmacion en dos fases (begin_sync/end_sync)
+    bool     sync_pending        = false;
+    uint64_t sync_epoch_snapshot = 0;
 
     // Tracking de epochs y sincronización
     uint64_t fill_epoch = 0;
@@ -329,6 +332,12 @@ struct llama_expert_source::impl {
         if (!backend || arena_buf != nullptr) {
             return;
         }
+        // Solo se puede sustituir la reserva mientras no haya bloques vivos: los
+        // punteros de la arena ya entregados dejarian de ser validos.
+        if (!l2_index.empty()) {
+            LLAMA_LOG_WARN("nexus-expert-stream: arena already in use, keeping PAGEABLE_HOST\n");
+            return;
+        }
 #if defined(GGML_USE_VULKAN)
         if (ggml_backend_is_vk(backend)) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -371,6 +380,9 @@ struct llama_expert_source::impl {
             }
         }
 #endif
+        // Sin backend Vulkan o sin host buft disponible: se mantiene la reserva
+        // posix_memalign (PAGEABLE_HOST). No se afirma que sea memoria pinned.
+        LLAMA_LOG_INFO("nexus-expert-stream: keeping PAGEABLE_HOST arena (no pinned host buffer available)\n");
     }
 
     // Allocator First-Fit
@@ -505,17 +517,13 @@ struct llama_expert_source::impl {
     void synchronize_active_fill() {
         std::unique_lock<std::mutex> lk(l2_mutex);
 
+        // El llamante NO cuenta en programming_fills: solo espera la compuerta.
         while (gate_closed) {
             if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
-            --programming_fills;
-            ++parked_fills;
-            cv_quiescent.notify_all();
             const uint64_t my_epoch = gate_epoch;
             cv_gate.wait(lk, [&]{
                 return teardown || aborted || fatal.load(std::memory_order_relaxed) || gate_epoch != my_epoch;
             });
-            ++programming_fills;
-            --parked_fills;
             if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
         }
 
@@ -523,7 +531,7 @@ struct llama_expert_source::impl {
         barrier_active = true;
 
         cv_quiescent.wait(lk, [&]{
-            return teardown || aborted || fatal.load(std::memory_order_relaxed) || programming_fills == 1;
+            return teardown || aborted || fatal.load(std::memory_order_relaxed) || programming_fills == 0;
         });
 
         if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
@@ -621,12 +629,74 @@ struct llama_expert_source::impl {
         cv_gate.notify_all();
     }
 
+    // Cierra la compuerta y toma una instantanea del epoch. El llamante debe
+    // ejecutar ggml_backend_synchronize() en el backend enlazado y luego end_sync().
+    void begin_sync() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
+            return;
+        }
+        // Sin backend enlazado no hay transferencias que confirmar, y antes del
+        // primer fill tampoco (UNKNOWN).
+        if (effective_sync_mode == sync_mode::HOST_ONLY ||
+            effective_sync_mode == sync_mode::UNKNOWN) {
+            return;
+        }
+
+        while (gate_closed) {
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+            const uint64_t my_epoch = gate_epoch;
+            cv_gate.wait(lk, [&]{
+                return teardown || aborted || fatal.load(std::memory_order_relaxed) || gate_epoch != my_epoch;
+            });
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+        }
+
+        gate_closed    = true;
+        barrier_active = true;
+
+        cv_quiescent.wait(lk, [&]{
+            return teardown || aborted || fatal.load(std::memory_order_relaxed) || programming_fills == 0;
+        });
+
+        if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
+            gate_closed    = false;
+            barrier_active = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
+        sync_epoch_snapshot = fill_epoch;
+        sync_pending        = true;
+    }
+
+    // El llamante ya sincronizo el backend enlazado.
+    void end_sync() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        if (!sync_pending) {
+            return;
+        }
+        sync_pending = false;
+
+        ++sync_calls;
+        process_inflight_upto(sync_epoch_snapshot);
+
+        barrier_active = false;
+        gate_closed    = false;
+        ++gate_epoch;
+        cv_gate.notify_all();
+    }
+
     void drain_for_teardown() {
         std::unique_lock<std::mutex> lk(l2_mutex);
 
         teardown    = true;
         frozen      = true;
         gate_closed = true;
+        sync_pending = false;
 
         cv_gate.notify_all();
         cv_quiescent.notify_all();
@@ -634,7 +704,11 @@ struct llama_expert_source::impl {
         cv_idle.wait(lk, [&]{ return active_fills == 0; });
 
         if (barrier_active) {
-            std::_Exit(EXIT_FAILURE);
+            // Otra hebra esta a mitad de barrera. La destruccion concurrente con
+            // uso del objeto es un error del llamante: no se usa _Exit (B1), se
+            // registra y se omite la sincronizacion final.
+            LLAMA_LOG_ERROR("nexus-expert-stream: teardown with an active barrier, skipping final sync\n");
+            return;
         }
 
         ++sync_calls;
@@ -645,9 +719,13 @@ struct llama_expert_source::impl {
 
         lk.lock();
         if (!sync_ok) {
+            // En teardown no se usa fail-stop: el proceso esta terminando y el
+            // backend se destruye a continuacion. Las transferencias no se marcan
+            // como confirmadas.
             ++sync_failures;
-            lk.unlock();
-            enter_fail_stop(fail_reason::teardown_sync_failed);
+            fatal.store(true, std::memory_order_release);
+            LLAMA_LOG_ERROR("nexus-expert-stream: final synchronize failed during teardown\n");
+            return;
         }
         process_inflight_upto(sync_epoch);
     }
@@ -655,16 +733,21 @@ struct llama_expert_source::impl {
 
 struct llama_expert_source::impl::fill_active_guard {
     llama_expert_source::impl * im = nullptr;
-    bool armed = false;
+    bool active_armed      = false;
+    bool programming_armed = false;
 
     explicit fill_active_guard(llama_expert_source::impl * p) : im(p) {}
-    void arm() noexcept { armed = true; }
+    void arm_active()      noexcept { active_armed = true; }
+    void arm_programming() noexcept { programming_armed = true; }
 
     ~fill_active_guard() {
-        if (armed && im) {
+        if (active_armed && im) {
             std::lock_guard<std::mutex> lk(im->l2_mutex);
             --im->active_fills;
-            --im->programming_fills;
+            if (programming_armed) {
+                --im->programming_fills;
+                programming_armed = false;
+            }
             if (im->active_fills == 0) {
                 im->cv_idle.notify_all();
             }
@@ -798,8 +881,7 @@ llama_expert_fill_status llama_expert_source::fill_expert(
             return llama_expert_fill_status::IO_ERROR;
         }
         ++p.active_fills;
-        ++p.programming_fills;
-        guard.arm();
+        guard.arm_active();
 
         // B3: Comprobación estricta de backend
         if (p.bound_backend != nullptr && backend != nullptr && p.bound_backend != backend) {
@@ -966,22 +1048,16 @@ llama_expert_fill_status llama_expert_source::fill_expert(
             return llama_expert_fill_status::IO_ERROR;
         }
 
+        // Esta hebra aun NO programa nada: no cuenta en programming_fills, solo
+        // espera a que la barrera en curso abra la compuerta.
         while (p.gate_closed) {
             if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
                 return llama_expert_fill_status::IO_ERROR;
             }
-            --p.programming_fills;
-            ++p.parked_fills;
-            p.cv_quiescent.notify_all();
-
             const uint64_t my_epoch = p.gate_epoch;
             p.cv_gate.wait(lk, [&]{
                 return p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed) || p.gate_epoch != my_epoch;
             });
-
-            ++p.programming_fills;
-            --p.parked_fills;
-
             if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
                 return llama_expert_fill_status::IO_ERROR;
             }
@@ -995,6 +1071,11 @@ llama_expert_fill_status llama_expert_source::fill_expert(
         if (p.fill_epoch == UINT64_MAX) {
             p.enter_fail_stop(fail_reason::epoch_overflow);
         }
+
+        // A partir de aquí la hebra programa una transferencia: cuenta para la
+        // quiescencia de las barreras hasta que regrese de set_async.
+        ++p.programming_fills;
+        guard.arm_programming();
 
         auto it = p.l2_index.find(key);
         if (it != p.l2_index.end()) {
@@ -1031,6 +1112,14 @@ void llama_expert_source::on_layer_synchronized(int32_t il) {
 
 void llama_expert_source::synchronize_all() {
     pimpl->synchronize_external();
+}
+
+void llama_expert_source::begin_sync() {
+    pimpl->begin_sync();
+}
+
+void llama_expert_source::end_sync() {
+    pimpl->end_sync();
 }
 
 const llama_expert_stats & llama_expert_source::get_stats() const {

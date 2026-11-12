@@ -351,6 +351,110 @@ static void test_b1_b4_robustness_invariants() {
     printf("[PASS] Bloques B1-B4 robustness invariants passed all tests.\n");
 }
 
+static void test_two_phase_sync_and_teardown() {
+    printf("[TEST] Testing begin_sync/end_sync, pread failure and teardown invariants...\n");
+
+    llama_expert_model_meta meta;
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 10 * 1024 * 1024;
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_sync_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t fake_file_size = 10 * 1024 * 1024;
+    ftruncate(fd, fake_file_size);
+    meta.files.push_back({ temp_path, fake_file_size });
+
+    ggml_tensor t_ok{}, t_bad{};
+    t_ok.ne[2]  = 5; t_ok.nb[2]  = 1000000;
+    t_bad.ne[2] = 5; t_bad.nb[2] = 1000000;
+    meta.tensors[&t_ok]  = { 0, 0, 1000000, 1000000, 5, true };
+    // extents fuera del archivo: pread_full debe fallar y propagar IO_ERROR
+    meta.tensors[&t_bad] = { 0, fake_file_size + 4096, 1000000, 1000000, 5, true };
+
+    auto exsrc = llama_expert_source::create(meta, cfg);
+    TEST_CHECK(exsrc != nullptr, "Create failed");
+
+    // Antes de cualquier fill no hay nada programado: begin/end no cuentan sync
+    exsrc->begin_sync();
+    exsrc->end_sync();
+    TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 0,
+               "empty begin/end must not count a synchronization");
+
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    TEST_CHECK(cpu != nullptr, "Failed to initialize CPU backend");
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(ggml_backend_get_device(cpu));
+    const size_t bank_total_bytes = 5000000;
+    ggml_backend_buffer_t bank_buf = ggml_backend_buft_alloc_buffer(cpu_buft, bank_total_bytes);
+    TEST_CHECK(bank_buf != nullptr, "Failed to alloc bank buffer");
+
+    ggml_tensor bank{};
+    bank.type = GGML_TYPE_I8;
+    bank.ne[0] = bank_total_bytes;
+    bank.ne[1] = 1;
+    bank.ne[2] = 1;
+    bank.ne[3] = 1;
+    bank.nb[0] = 1;
+    bank.nb[1] = bank_total_bytes;
+    bank.nb[2] = bank_total_bytes;
+    bank.nb[3] = bank_total_bytes;
+    bank.buffer = bank_buf;
+    bank.data   = ggml_backend_buffer_get_base(bank_buf);
+
+    auto st = exsrc->fill_expert(cpu, &bank, 0, &t_ok, 0, 0, 1000000);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill on CPU backend failed");
+    TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 1,
+               "a programmed transfer must be inflight until confirmed");
+
+    // Confirmacion en dos fases: el llamante sincroniza entre begin y end
+    exsrc->begin_sync();
+    ggml_backend_synchronize(cpu);
+    exsrc->end_sync();
+    TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 0,
+               "end_sync must confirm the covered transfer");
+    TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 1,
+               "end_sync must count exactly one synchronization");
+
+    // La compuerta quedo abierta: un nuevo fill debe poder programarse
+    st = exsrc->fill_expert(cpu, &bank, 0, &t_ok, 1, 1000000, 1000000);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill after end_sync failed");
+
+    // end_sync sin begin_sync no confirma nada
+    exsrc->end_sync();
+    TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 1,
+               "end_sync without begin_sync must be a no-op");
+    TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 1,
+               "end_sync without begin_sync must not confirm the transfer");
+
+    // Error de lectura: se propaga y el bloque no queda como RESIDENT valido
+    st = exsrc->fill_expert(cpu, &bank, 0, &t_bad, 0, 0, 1000000);
+    TEST_CHECK(st == llama_expert_fill_status::IO_ERROR, "pread failure must return IO_ERROR");
+
+    const auto & s = exsrc->get_arena_stats();
+    TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+               "arena invariant violated after a failed read");
+
+    // Destruccion con una transferencia aun pendiente: drain_for_teardown la
+    // confirma antes de liberar la arena.
+    exsrc.reset();
+
+    // Destruccion sin backend enlazado (modo HOST_ONLY)
+    auto exsrc_host = llama_expert_source::create(meta, cfg);
+    TEST_CHECK(exsrc_host != nullptr, "Create (HOST_ONLY) failed");
+    ggml_tensor dummy_bank{};
+    st = exsrc_host->fill_expert(nullptr, &dummy_bank, 0, &t_ok, 0, 0, 1000000);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "HOST_ONLY fill failed");
+    exsrc_host.reset();
+
+    ggml_backend_buffer_free(bank_buf);
+    ggml_backend_free(cpu);
+
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] Two-phase sync, pread failure and teardown passed all tests.\n");
+}
+
 int main() {
     printf("=== RUNNING NEXUS EXPERT SOURCE UNIT TESTS ===\n");
     test_pread_full();
@@ -358,6 +462,7 @@ int main() {
     test_allocator_coalescing_and_fragmentation();
     test_concurrency_and_barrier_quiescence();
     test_b1_b4_robustness_invariants();
+    test_two_phase_sync_and_teardown();
     printf("=== ALL NEXUS EXPERT SOURCE TESTS PASSED ===\n");
     return 0;
 }

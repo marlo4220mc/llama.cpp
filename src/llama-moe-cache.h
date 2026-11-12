@@ -7,6 +7,7 @@
 #include <vector>
 
 struct llama_model;
+class llama_expert_source;
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
@@ -14,7 +15,8 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share);
+    // expert_source: optional Nexus L2 source for the expert bytes (NVMe -> RAM -> VRAM), nullptr = read the mmap weights
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, llama_expert_source * expert_source = nullptr);
     ~llama_moe_cache();
 
     // the device that caches layer il
