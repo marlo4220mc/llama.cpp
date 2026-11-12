@@ -135,6 +135,7 @@ static void test_l2_dimensioning_and_pinning() {
 
     const auto & stats = exsrc->get_stats();
     TEST_CHECK(stats.fills == 2, "fills stat count mismatch");
+    TEST_CHECK(stats.fill_attempts == 2, "fill_attempts stat count mismatch");
     TEST_CHECK(stats.l2_hits == 1, "l2_hits stat count mismatch");
     TEST_CHECK(stats.l2_misses == 1, "l2_misses stat count mismatch");
 

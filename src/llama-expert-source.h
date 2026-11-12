@@ -132,7 +132,11 @@ struct llama_expert_arena_stats {
 //   - `upload_bytes` son los bytes efectivamente programados hacia el banco del
 //     dispositivo; un fill en modo host (sin backend) no suma aqui.
 struct llama_expert_stats {
-    std::atomic<uint64_t> fills          { 0 }; // fills aceptados (pasaron la validacion de extent)
+    std::atomic<uint64_t> fill_attempts  { 0 }; // llamadas recibidas
+    std::atomic<uint64_t> fills          { 0 }; // fills completados con LOADED
+    std::atomic<uint64_t> completed_reads { 0 }; // lecturas pread completadas
+    std::atomic<uint64_t> uploads_programmed { 0 }; // transferencias set_async emitidas
+    std::atomic<uint64_t> uploads_confirmed { 0 }; // entradas inflight confirmadas
     std::atomic<uint64_t> l2_hits        { 0 }; // experto ya RESIDENT en la arena L2
     std::atomic<uint64_t> l2_misses      { 0 }; // experto que hubo que leer de NVMe
     std::atomic<uint64_t> proc_bytes     { 0 }; // bytes leidos de NVMe
@@ -170,6 +174,12 @@ enum class llama_expert_tensor_role {
     DOWN
 };
 
+enum class llama_expert_tensor_validation {
+    UNSUPPORTED,
+    VALID,
+    INVALID,
+};
+
 struct llama_expert_tensor_meta {
     int32_t  shard_idx     = -1;
     uint64_t base_offset   = 0;
@@ -179,6 +189,7 @@ struct llama_expert_tensor_meta {
     bool     is_supported  = false;
     int32_t  layer_id      = -1; // capa a la que pertenece, -1 desconocida
     llama_expert_tensor_role role = llama_expert_tensor_role::UNKNOWN;
+    llama_expert_tensor_validation validation = llama_expert_tensor_validation::UNSUPPORTED;
 };
 
 struct llama_expert_model_meta {

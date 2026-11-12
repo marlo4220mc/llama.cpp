@@ -2178,13 +2178,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 t_meta.layer_id      = (int32_t) il;
                 t_meta.role          = cand.role;
 
-                const bool is_moe        = (t->ne[2] > 1);
-                const bool is_row_dense  = (t->nb[1] == ggml_row_size(t->type, t->ne[0]));
-                const bool is_exp_dense  = (t->nb[2] == (uint64_t) t->ne[1] * t->nb[1]);
-                const uint64_t shard_sz  = (uint64_t) ml.files[it->second.idx]->size();
-                const bool fits_in_shard = (it->second.offs + (uint64_t) t->ne[2] * t->nb[2] <= shard_sz);
+                const bool is_moe       = (t->ne[2] > 1);
+                const bool is_row_dense = (t->nb[1] == ggml_row_size(t->type, t->ne[0]));
 
-                t_meta.is_supported = (is_moe && is_row_dense && is_exp_dense && fits_in_shard);
+                // Separar incompatibilidad geométrica de metadatos corruptos.
+                // Nunca calcular extent ni acceder a ml.files sin validar idx y
+                // las multiplicaciones/sumas que lo forman.
+                bool metadata_valid = it->second.idx < ml.files.size();
+                uint64_t extent_bytes = 0;
+                if (metadata_valid && t->ne[2] > 0 && t->nb[2] > 0 &&
+                    (uint64_t) t->ne[2] <= UINT64_MAX / (uint64_t) t->nb[2]) {
+                    extent_bytes = (uint64_t) t->ne[2] * (uint64_t) t->nb[2];
+                } else {
+                    metadata_valid = false;
+                }
+                if (metadata_valid && it->second.offs > UINT64_MAX - extent_bytes) {
+                    metadata_valid = false;
+                }
+                const uint64_t shard_sz = metadata_valid ? (uint64_t) ml.files[it->second.idx]->size() : 0;
+                const bool fits_in_shard = metadata_valid && it->second.offs + extent_bytes <= shard_sz;
+                if (!fits_in_shard && metadata_valid) {
+                    metadata_valid = false;
+                }
+
+                const bool is_exp_dense = metadata_valid &&
+                    (t->nb[2] == (uint64_t) t->ne[1] * t->nb[1]);
+                t_meta.validation = !metadata_valid ? llama_expert_tensor_validation::INVALID :
+                    ((is_moe && is_row_dense && is_exp_dense) ? llama_expert_tensor_validation::VALID :
+                                                                  llama_expert_tensor_validation::UNSUPPORTED);
+                t_meta.is_supported = t_meta.validation == llama_expert_tensor_validation::VALID;
                 expert_meta.tensors[t] = t_meta;
             }
         }

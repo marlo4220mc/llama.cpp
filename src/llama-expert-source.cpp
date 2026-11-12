@@ -94,7 +94,11 @@ void llama_expert_stats::record(llama_expert_fill_status st) {
 }
 
 void llama_expert_stats::log(const char * tag) const {
+    const uint64_t attempts  = fill_attempts.load();
     const uint64_t total     = fills.load();
+    const uint64_t reads     = completed_reads.load();
+    const uint64_t programmed = uploads_programmed.load();
+    const uint64_t confirmed = uploads_confirmed.load();
     const uint64_t l2_h      = l2_hits.load();
     const uint64_t l2_m      = l2_misses.load();
     const uint64_t bytes     = proc_bytes.load();
@@ -107,7 +111,7 @@ void llama_expert_stats::log(const char * tag) const {
     const uint64_t rej_io    = rejected_io.load();
     const uint64_t rej_inv   = rejected_invalid.load();
 
-    if (total == 0 && l2_h == 0 && l2_m == 0 && fallback == 0 && not_sup == 0 &&
+    if (attempts == 0 && total == 0 && l2_h == 0 && l2_m == 0 && fallback == 0 && not_sup == 0 &&
         oom == 0 && rej_io == 0 && rej_inv == 0) {
         return;
     }
@@ -117,17 +121,19 @@ void llama_expert_stats::log(const char * tag) const {
     // Los aciertos de L1 (banco del dispositivo) los reporta llama_moe_cache.
     const uint64_t lookups  = l2_h + l2_m;
     const double   hit_rate = lookups > 0 ? 100.0 * (double) l2_h / (double) lookups : 0.0;
-    const double   avg_us   = l2_m > 0 ? (double) us / (double) l2_m : 0.0;
+    const double   avg_us   = reads > 0 ? (double) us / (double) reads : 0.0;
     const double   mb       = (double) bytes / (1024.0 * 1024.0);
     const double   up_mb    = (double) uploaded / (1024.0 * 1024.0);
     const double   thr      = us > 0 ? mb / ((double) us / 1000000.0) : 0.0;
 
     LLAMA_LOG_INFO(
-        "nexus-expert-stream [%s]: fills=%lu | L2: hit=%lu miss=%lu (hit_rate=%.1f%%)\n",
-        tag, (unsigned long) total, (unsigned long) l2_h, (unsigned long) l2_m, hit_rate);
+        "nexus-expert-stream [%s]: attempts=%lu fills=%lu reads=%lu uploads=%lu confirmed=%lu | L2: hit=%lu miss=%lu (hit_rate=%.1f%%)\n",
+        tag, (unsigned long) attempts, (unsigned long) total, (unsigned long) reads,
+        (unsigned long) programmed, (unsigned long) confirmed,
+        (unsigned long) l2_h, (unsigned long) l2_m, hit_rate);
     LLAMA_LOG_INFO(
-        "nexus-expert-stream [%s]: NVMe: %.2f MiB in %lu reads, avg=%.1f us, max=%lu us (%.2f MiB/s) | uploaded: %.2f MiB\n",
-        tag, mb, (unsigned long) l2_m, avg_us, (unsigned long) max_u, thr, up_mb);
+        "nexus-expert-stream [%s]: NVMe: %.2f MiB in %lu completed reads, avg=%.1f us, max=%lu us (%.2f MiB/s) | uploaded: %.2f MiB\n",
+        tag, mb, (unsigned long) reads, avg_us, (unsigned long) max_u, thr, up_mb);
     LLAMA_LOG_INFO(
         "nexus-expert-stream [%s]: fallback mmap=%lu not_supported=%lu oom=%lu rejected_io=%lu rejected_invalid=%lu | drops=%lu verify ok=%lu fail=%lu\n",
         tag, (unsigned long) fallback, (unsigned long) not_sup, (unsigned long) oom,
@@ -136,7 +142,11 @@ void llama_expert_stats::log(const char * tag) const {
 }
 
 void llama_expert_stats::reset() {
+    fill_attempts.store(0);
     fills.store(0);
+    completed_reads.store(0);
+    uploads_programmed.store(0);
+    uploads_confirmed.store(0);
     l2_hits.store(0);
     l2_misses.store(0);
     proc_bytes.store(0);
@@ -424,10 +434,33 @@ struct llama_expert_source::impl {
             if (dev) {
                 ggml_backend_buffer_type_t expected_buft = ggml_backend_dev_host_buffer_type(dev);
                 if (expected_buft != nullptr && expected_buft == ggml_backend_vk_host_buffer_type()) {
+                    const size_t required_alignment = ggml_backend_buft_get_alignment(expected_buft);
+                    if (required_alignment == 0 ||
+                        (required_alignment & (required_alignment - 1)) != 0 ||
+                        required_alignment % sizeof(void *) != 0) {
+                        LLAMA_LOG_ERROR("nexus-expert-stream: invalid effective host-buffer alignment: %zu\n",
+                                required_alignment);
+                        return;
+                    }
+                    if (required_alignment > alignment) {
+                        // Todavia no hay bloques: se puede cambiar la alineacion
+                        // del allocator antes de aceptar el primer fill.
+                        alignment = required_alignment;
+                    }
                     ggml_backend_buffer_t vk_buf = ggml_backend_buft_alloc_buffer(expected_buft, arena_bytes);
                     if (vk_buf != nullptr) {
                         ggml_backend_buffer_type_t effective_buft = ggml_backend_buffer_get_type(vk_buf);
+                        const size_t effective_alignment = ggml_backend_buffer_get_alignment(vk_buf);
                         void * new_base = ggml_backend_buffer_get_base(vk_buf);
+                        if (effective_alignment == 0 ||
+                            (effective_alignment & (effective_alignment - 1)) != 0 ||
+                            effective_alignment % sizeof(void *) != 0) {
+                            LLAMA_LOG_ERROR("nexus-expert-stream: invalid allocated-buffer alignment: %zu\n",
+                                    effective_alignment);
+                            ggml_backend_buffer_free(vk_buf);
+                            return;
+                        }
+                        alignment = std::max(alignment, effective_alignment);
                         if (effective_buft == expected_buft && new_base != nullptr) {
                             // Escenario 1: PINNED_VK exitoso
                             if (owns_arena && arena_base) {
@@ -564,12 +597,20 @@ struct llama_expert_source::impl {
             return l2_inflight.empty();
         }
         if (effective_sync_mode == sync_mode::CPU_SYNC) {
-            if (bound_backend) {
-                ggml_backend_synchronize(bound_backend);
+            if (!bound_backend || ggml_backend_dev_type(ggml_backend_get_device(bound_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                return false;
             }
+            ggml_backend_synchronize(bound_backend);
             return true;
         }
         if (effective_sync_mode == sync_mode::CALLBACK_SYNC) {
+#if defined(GGML_USE_VULKAN)
+            if (!bound_backend || !ggml_backend_is_vk(bound_backend)) {
+                return false;
+            }
+#else
+            return false;
+#endif
             try {
                 ggml_backend_synchronize(bound_backend);
                 return true;
@@ -595,6 +636,7 @@ struct llama_expert_source::impl {
                 enter_fail_stop(fail_reason::inflight_underflow);
             }
             --blk.inflight;
+            stats.uploads_confirmed.fetch_add(1, std::memory_order_relaxed);
             it = l2_inflight.erase(it);
         }
         last_confirmed_epoch = sync_epoch;
@@ -1089,9 +1131,18 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
     }
 
     auto it_ext = p.extents.find(w);
-    if (it_ext == p.extents.end() || !it_ext->second.is_supported) {
+    if (it_ext == p.extents.end()) {
         return llama_expert_fill_status::FALLBACK_ALLOWED;
     }
+    if (it_ext->second.validation == llama_expert_tensor_validation::INVALID) {
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (it_ext->second.validation == llama_expert_tensor_validation::UNSUPPORTED &&
+        !it_ext->second.is_supported) {
+        return llama_expert_fill_status::NOT_SUPPORTED;
+    }
+    // Los fixtures/consumidores antiguos pueden omitir validation y conservar
+    // is_supported=true; se acepta esa compatibilidad solo para esos metadatos.
 
     const auto & ext = it_ext->second;
 
@@ -1151,7 +1202,6 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
         return llama_expert_fill_status::NOT_SUPPORTED;
     }
 
-    p.stats.fills++;
     llama_expert_key key { il, reinterpret_cast<uintptr_t>(w), expert };
 
     // --- 1. Consulta L2 Cache & Coordinación LOADING (B2) ---
@@ -1236,9 +1286,26 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
             blk.inflight   = 0;
             blk.lru_tick   = ++p.current_lru_tick;
 
-            p.l2_lru_list.push_front(key);
-            blk.lru_it = p.l2_lru_list.begin();
-            p.l2_index[key] = blk;
+            try {
+                p.l2_lru_list.push_front(key);
+                blk.lru_it = p.l2_lru_list.begin();
+                const auto inserted = p.l2_index.emplace(key, blk);
+                if (!inserted.second) {
+                    p.l2_lru_list.erase(blk.lru_it);
+                    p.free_block(alloc_off, alloc_sz, alloc_slk);
+                    return llama_expert_fill_status::IO_ERROR;
+                }
+            } catch (...) {
+                // El hueco y los contadores se restauran antes de propagar al
+                // wrapper C-safe; no queda una clave parcialmente publicada.
+                if (!p.l2_lru_list.empty() && p.l2_lru_list.front().layer_id == key.layer_id &&
+                    p.l2_lru_list.front().tensor_id == key.tensor_id &&
+                    p.l2_lru_list.front().expert_id == key.expert_id) {
+                    p.l2_lru_list.pop_front();
+                }
+                p.free_block(alloc_off, alloc_sz, alloc_slk);
+                return llama_expert_fill_status::OUT_OF_MEMORY;
+            }
             blk_offset = alloc_off;
         }
 
@@ -1265,6 +1332,7 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
 
         const uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         p.stats.proc_bytes += expert_size;
+        p.stats.completed_reads.fetch_add(1, std::memory_order_relaxed);
         p.stats.io_us_total += us;
 
         uint64_t cur_max = p.stats.io_us_max.load();
@@ -1314,30 +1382,55 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
             p.enter_fail_stop(fail_reason::epoch_overflow);
         }
 
+        // La transferencia solo puede programarse si el bloque RESIDENT sigue
+        // existiendo y coincide exactamente con el rango que se va a leer.
+        // Registrar primero el inflight protege la arena frente a eviction y
+        // permite que la barrera lo confirme por epoch.
+        auto it = p.l2_index.find(key);
+        if (it == p.l2_index.end() ||
+            it->second.content != llama_expert_content::RESIDENT ||
+            it->second.offset != blk_offset ||
+            it->second.req_bytes != expert_size ||
+            it->second.offset > p.arena_bytes ||
+            it->second.req_bytes > p.arena_bytes - it->second.offset) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: source block disappeared or changed before upload\n");
+            return llama_expert_fill_status::IO_ERROR;
+        }
+
         // A partir de aquí la hebra programa una transferencia: cuenta para la
         // quiescencia de las barreras hasta que regrese de set_async.
         ++p.programming_fills;
         guard.arm_programming();
 
-        auto it = p.l2_index.find(key);
-        if (it != p.l2_index.end()) {
-            uint64_t next_epoch = p.fill_epoch + 1;
-            try {
-                p.l2_inflight.push_back({ key, next_epoch });
-            } catch (...) {
-                // Si la asignación de memoria para l2_inflight falla, no alterar contadores
-                return llama_expert_fill_status::OUT_OF_MEMORY;
-            }
-            p.fill_epoch = next_epoch;
-            it->second.inflight++;
-            it->second.last_fill_epoch = next_epoch;
+        if (p.fill_epoch == UINT64_MAX) {
+            p.enter_fail_stop(fail_reason::epoch_overflow);
         }
+        const uint64_t next_epoch = p.fill_epoch + 1;
+        try {
+            p.l2_inflight.push_back({ key, next_epoch });
+        } catch (...) {
+            // No se modifico el bloque ni el epoch: el guard libera
+            // programming_fills y no queda ninguna transferencia anunciada.
+            return llama_expert_fill_status::OUT_OF_MEMORY;
+        }
+        p.fill_epoch = next_epoch;
+        it->second.inflight++;
+        it->second.last_fill_epoch = next_epoch;
 
         lk.unlock();
 
         void * src_ptr = static_cast<uint8_t *>(p.arena_base) + blk_offset;
-        ggml_backend_tensor_set_async(backend, bank, src_ptr, slot_offset, expert_size);
+        try {
+            ggml_backend_tensor_set_async(backend, bank, src_ptr, slot_offset, expert_size);
+        } catch (...) {
+            // La interfaz C de GGML no debe recibir una excepción. El registro
+            // ya protege el bloque; conservarlo como pendiente permite que el
+            // teardown lo trate como no confirmado, en vez de reutilizar la arena.
+            p.fatal.store(true, std::memory_order_release);
+            return llama_expert_fill_status::IO_ERROR;
+        }
         p.stats.upload_bytes.fetch_add(expert_size, std::memory_order_relaxed);
+        p.stats.uploads_programmed.fetch_add(1, std::memory_order_relaxed);
     }
 
     return llama_expert_fill_status::LOADED;
@@ -1351,8 +1444,18 @@ llama_expert_fill_status llama_expert_source::fill_expert(
         int32_t expert,
         size_t slot_offset,
         size_t expert_size) {
-    const auto status = fill_expert_impl(backend, bank, il, w, expert, slot_offset, expert_size);
-    if (status != llama_expert_fill_status::LOADED) {
+    llama_expert_fill_status status = llama_expert_fill_status::IO_ERROR;
+    try {
+        status = fill_expert_impl(backend, bank, il, w, expert, slot_offset, expert_size);
+    } catch (...) {
+        // Nunca dejar que una excepción C++ atraviese el callback C del scheduler.
+        pimpl->fatal.store(true, std::memory_order_release);
+        status = llama_expert_fill_status::IO_ERROR;
+    }
+    pimpl->stats.fill_attempts.fetch_add(1, std::memory_order_relaxed);
+    if (status == llama_expert_fill_status::LOADED) {
+        pimpl->stats.fills.fetch_add(1, std::memory_order_relaxed);
+    } else {
         pimpl->stats.record(status);
     }
     return status;
