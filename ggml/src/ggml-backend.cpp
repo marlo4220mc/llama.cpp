@@ -1230,6 +1230,10 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    // set by ggml_backend_sched_abort() from a copy callback that could not
+    // prepare a required input; the compute stops before the affected split
+    bool abort_requested;
+
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
@@ -2238,6 +2242,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             if (ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
                 ggml_backend_sched_copy_input(sched, split, input);
+                if (sched->abort_requested) {
+                    return GGML_STATUS_ABORTED;
+                }
             }
         }
 
@@ -2476,6 +2483,11 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    // a copy callback may request an abort during this compute; a request from a
+    // previous compute is stale because the callback is only valid for the graph
+    // it was invoked for
+    sched->abort_requested = false;
+
     return ggml_backend_sched_compute_splits(sched);
 }
 
@@ -2502,6 +2514,11 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_abort(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    sched->abort_requested = true;
 }
 
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {

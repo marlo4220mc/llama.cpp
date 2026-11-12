@@ -391,6 +391,9 @@ struct llama_moe_cache::impl {
     // Nexus L2 source of the expert bytes, nullptr = read the mmap weights
     llama_expert_source * expert_source = nullptr;
 
+    // set when an expert could not be prepared; the graph must not be computed
+    bool fatal_error = false;
+
     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
     FILE * trace = nullptr;
 
@@ -762,10 +765,10 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+    llama_moe_cache_copy_status copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
-            return false;
+            return llama_moe_cache_copy_status::NOT_HANDLED;
         }
         const int32_t il      = it->second.first;
         const bool    has_cpu = it->second.second;
@@ -869,7 +872,8 @@ struct llama_moe_cache::impl {
                         // silenciosa de un bloque que no se pudo leer de disco.
                         LLAMA_LOG_ERROR("%s: nexus failed to stream expert %d of layer %d (status %d)\n",
                                 __func__, fills[i].expert, il, (int) status);
-                        return true;
+                        fatal_error = true;
+                        return llama_moe_cache_copy_status::FATAL;
                     }
                     // FALLBACK_ALLOWED / NOT_SUPPORTED / OUT_OF_MEMORY: lectura mmap
                 }
@@ -892,7 +896,8 @@ struct llama_moe_cache::impl {
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
 
-        return true;
+        fatal_error = false;
+        return llama_moe_cache_copy_status::HANDLED;
     }
 
     void log_stats() const {
@@ -922,6 +927,10 @@ ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);
 }
 
+bool llama_moe_cache::has_fatal_error() const {
+    return pimpl->fatal_error;
+}
+
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const {
     return pimpl->get_slot_map(il, n_tokens, n_expert_used, cpu_part);
 }
@@ -934,7 +943,7 @@ ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
     return pimpl->get_cpu_map(il, n_tokens);
 }
 
-bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+llama_moe_cache_copy_status llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
 }
 

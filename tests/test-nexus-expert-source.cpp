@@ -1,4 +1,5 @@
 #include "../src/llama-expert-source.h"
+#include "../ggml/include/ggml-alloc.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -455,6 +456,94 @@ static void test_two_phase_sync_and_teardown() {
     printf("[PASS] Two-phase sync, pread failure and teardown passed all tests.\n");
 }
 
+struct sched_abort_state {
+    ggml_backend_sched_t sched = nullptr;
+    bool invoked = false;
+};
+
+static bool sched_abort_copy_cb(ggml_backend_t /*backend*/, const ggml_tensor * /*src*/, ggml_tensor * /*dst*/, ggml_cgraph * /*graph*/, void * user_data) {
+    auto * st = static_cast<sched_abort_state *>(user_data);
+    st->invoked = true;
+    // report the input as handled (true) and ask the scheduler to abort: returning
+    // false here would silently perform the conventional copy
+    ggml_backend_sched_abort(st->sched);
+    return true;
+}
+
+static void test_sched_abort_from_copy_callback() {
+    printf("[TEST] Testing scheduler abort requested by a copy callback...\n");
+
+    // llama_backend_init() normally loads the backends; this test does not
+    // initialize llama, so load them here to see the GPU devices
+    ggml_backend_load_all();
+
+    ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_dev == nullptr) {
+        gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+    }
+    if (gpu_dev == nullptr) {
+        // the callback is only invoked for a split whose backend cannot read the
+        // host weight directly; a CPU-only build has no such split
+        printf("[SKIP] no GPU backend: copy-callback abort not exercised in this build\n");
+        return;
+    }
+
+    ggml_backend_t backend_gpu = ggml_backend_dev_init(gpu_dev, nullptr);
+    ggml_backend_t backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    TEST_CHECK(backend_gpu != nullptr && backend_cpu != nullptr, "failed to initialize backends");
+
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+    ggml_init_params ip = { 1024*1024, nullptr, true };
+
+    // weights in a host buffer with WEIGHTS usage
+    ggml_context * ctx_w = ggml_init(ip);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 8, 8);
+    ggml_set_name(w, "w");
+    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, cpu_buft);
+    TEST_CHECK(buf_w != nullptr, "failed to allocate weight buffer");
+    ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // input in a host buffer
+    ggml_context * ctx_x = ggml_init(ip);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, 8, 64);
+    ggml_set_name(x, "x");
+    ggml_backend_buffer_t buf_x = ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, cpu_buft);
+    TEST_CHECK(buf_x != nullptr, "failed to allocate input buffer");
+
+    // graph: mul_mat on the GPU, with the host weight copied by the scheduler
+    ggml_context * ctx_g = ggml_init(ip);
+    ggml_tensor * y = ggml_mul_mat(ctx_g, w, x);
+    ggml_cgraph * gf = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_t backends[2] = { backend_gpu, backend_cpu };
+    ggml_backend_buffer_type_t bufts[2] = {
+        ggml_backend_get_default_buffer_type(backend_gpu),
+        ggml_backend_get_default_buffer_type(backend_cpu),
+    };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 64, false, true);
+    TEST_CHECK(sched != nullptr, "failed to create scheduler");
+
+    sched_abort_state state;
+    state.sched = sched;
+    ggml_backend_sched_set_copy_callback(sched, sched_abort_copy_cb, &state);
+
+    const ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
+    TEST_CHECK(state.invoked, "the copy callback was not invoked");
+    TEST_CHECK(status == GGML_STATUS_ABORTED, "the scheduler did not return GGML_STATUS_ABORTED");
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buf_w);
+    ggml_backend_buffer_free(buf_x);
+    ggml_free(ctx_g);
+    ggml_free(ctx_x);
+    ggml_free(ctx_w);
+    ggml_backend_free(backend_gpu);
+    ggml_backend_free(backend_cpu);
+
+    printf("[PASS] Scheduler abort from copy callback passed.\n");
+}
+
 int main() {
     printf("=== RUNNING NEXUS EXPERT SOURCE UNIT TESTS ===\n");
     test_pread_full();
@@ -463,6 +552,7 @@ int main() {
     test_concurrency_and_barrier_quiescence();
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();
+    test_sched_abort_from_copy_callback();
     printf("=== ALL NEXUS EXPERT SOURCE TESTS PASSED ===\n");
     return 0;
 }

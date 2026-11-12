@@ -445,6 +445,11 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // set when a decode/encode could not complete because an expert could not be
+    // prepared (Nexus I/O failure). The KV cache may contain entries for the
+    // partially processed batch, so the context refuses further work.
+    bool failed = false;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

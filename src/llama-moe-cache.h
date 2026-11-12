@@ -9,6 +9,13 @@
 struct llama_model;
 class llama_expert_source;
 
+// result of the ggml_backend_sched copy callback
+enum class llama_moe_cache_copy_status {
+    NOT_HANDLED, // src is not a slot map: the scheduler keeps the conventional copy
+    HANDLED,     // the slot map and the experts it references are ready
+    FATAL,       // an expert could not be prepared: the split must not be computed
+};
+
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 class llama_moe_cache {
@@ -33,8 +40,14 @@ public:
     // nullptr if no misses of layer il are computed on the CPU for ubatches of n_tokens tokens
     ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const;
 
-    // ggml_backend_sched copy callback, returns false if src is not a slot map
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+    // ggml_backend_sched copy callback.
+    // NOT_HANDLED: src is not a slot map. HANDLED: the slot map and its experts
+    // are ready. FATAL: an expert could not be prepared, the caller must abort the
+    // graph compute (see ggml_backend_sched_abort) instead of computing the split.
+    llama_moe_cache_copy_status copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+
+    // true if a copy() returned FATAL since the last successful one
+    bool has_fatal_error() const;
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache

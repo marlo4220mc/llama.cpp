@@ -1911,6 +1911,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        if (status == GGML_STATUS_ABORTED && moe_cache && moe_cache->has_fatal_error()) {
+            // The split that needed the failed expert was not computed, but earlier
+            // splits may already have written to the KV cache. Do not let the
+            // context continue with a partially updated memory.
+            failed = true;
+            LLAMA_LOG_ERROR("%s: Nexus could not prepare an expert, the context is now unusable\n", __func__);
+        }
         ret = status;
         return nullptr;
     }
@@ -1921,6 +1928,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (failed) {
+        LLAMA_LOG_ERROR("%s: the context is unusable after a Nexus expert I/O failure, create a new context\n", __func__);
+        return -3; // GGML_STATUS_FAILED
+    }
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2169,6 +2181,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (failed) {
+        LLAMA_LOG_ERROR("%s: the context is unusable after a Nexus expert I/O failure, create a new context\n", __func__);
+        return -3; // GGML_STATUS_FAILED
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -3195,8 +3212,18 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
-        return true;
+    if (lctx->moe_cache) {
+        const auto st = lctx->moe_cache->copy(backend, src, dst, graph);
+        if (st == llama_moe_cache_copy_status::HANDLED) {
+            return true;
+        }
+        if (st == llama_moe_cache_copy_status::FATAL) {
+            // An expert slot could not be prepared. Report the input as handled so
+            // that the scheduler does not perform a conventional copy that would
+            // hide the failure, and request an abort before the split computes.
+            ggml_backend_sched_abort(lctx->sched.get());
+            return true;
+        }
     }
 
     auto & st = lctx->copy_experts;
