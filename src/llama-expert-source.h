@@ -194,6 +194,18 @@ public:
     // Ejecuta el contrato de seis pasos de §2.5.1.
     void synchronize_all();
 
+    // Detiene la admision de fills, espera a los fills activos y confirma las
+    // transferencias programadas antes de que el llamante libere la arena.
+    // Idempotente; el destructor lo invoca. Si no puede demostrar que una
+    // transferencia pendiente termino (barrera activa o sincronizacion fallida),
+    // la arena se retira sin liberarse (cuarentena del proceso) en vez de
+    // devolver memoria que el dispositivo podria estar usando.
+    void drain();
+
+    // true si la arena se retiro sin liberarse por no poder demostrar que el
+    // dispositivo dejo de usarla (inspeccion para pruebas)
+    bool was_arena_quarantined() const;
+
     // Confirmacion en dos fases de las transferencias programadas en el backend
     // enlazado, cuando la sincronizacion la hace el consumidor (p. ej. el MoE
     // cache antes de leer el slot map):

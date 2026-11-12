@@ -129,6 +129,7 @@ bool safe_align_up(size_t req_bytes, size_t A, size_t & out_aligned) noexcept {
 enum class fail_reason {
     none,
     epoch_overflow,
+    epoch_regression,
     sync_failed,
     teardown_sync_failed,
     inflight_without_block,
@@ -212,6 +213,9 @@ struct llama_expert_source::impl {
     size_t                arena_bytes = 0;
     size_t                alignment   = 0;
     bool                  owns_arena  = false;
+    // la arena se retiro del uso sin liberarla (cuarentena del proceso): puede
+    // haber una transferencia del dispositivo que aun la este leyendo
+    std::atomic<bool>     arena_quarantined{false};
     llama_expert_mem_kind mem_kind    = llama_expert_mem_kind::PAGEABLE_HOST;
 
     // Allocator First-Fit
@@ -325,6 +329,33 @@ struct llama_expert_source::impl {
         }
 
         std::_Exit(EXIT_FAILURE);
+    }
+
+    // Retira la arena del uso sin liberarla. Se usa cuando no se puede demostrar
+    // que el dispositivo ya no la esta leyendo (transferencia pendiente cuyo
+    // resultado de sincronizacion no se puede observar, o barrera activa al
+    // iniciar el teardown). La memoria se filtra a proposito: es preferible
+    // perderla a devolverla al heap mientras Vulkan/CPU todavia la usa.
+    void quarantine_arena(fail_reason reason) noexcept {
+        arena_quarantined.store(true, std::memory_order_release);
+
+        if (preallocated_quarantine) {
+            quarantine_node * q = preallocated_quarantine.release();
+            q->arena_buf   = arena_buf;
+            q->arena_base  = arena_base;
+            q->arena_bytes = arena_bytes;
+            q->owns_arena  = owns_arena;
+            q->backend     = bound_backend;
+            q->reason      = reason;
+            q->fail_stop   = false;
+
+            g_arena_quarantine.enroll(q);
+        }
+
+        // pase lo que pase, el destructor no debe liberar esta memoria
+        arena_buf  = nullptr;
+        arena_base = nullptr;
+        owns_arena = false;
     }
 
 
@@ -474,6 +505,12 @@ struct llama_expert_source::impl {
     }
 
     bool resolve_sync(uint64_t /* sync_epoch */) {
+        if (effective_sync_mode == sync_mode::UNKNOWN) {
+            // Ningun fill enlazo un backend: no hay transferencia que confirmar.
+            // Devolver false aqui marcaria un fallo de sincronizacion inexistente
+            // al destruir una fuente que nunca se uso.
+            return l2_inflight.empty();
+        }
         if (effective_sync_mode == sync_mode::HOST_ONLY) {
             return l2_inflight.empty();
         }
@@ -547,6 +584,17 @@ struct llama_expert_source::impl {
             return;
         }
 
+        // Con la compuerta cerrada y programming_fills == 0, l2_inflight es el
+        // conjunto completo de transferencias no confirmadas. Si esta vacio no
+        // hay nada que sincronizar: no se contabiliza una sincronizacion.
+        if (l2_inflight.empty()) {
+            barrier_active = false;
+            gate_closed    = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
         ++sync_calls;
         const uint64_t sync_epoch = fill_epoch;
         lk.unlock();
@@ -558,6 +606,12 @@ struct llama_expert_source::impl {
             ++sync_failures;
             lk.unlock();
             enter_fail_stop(fail_reason::sync_failed);
+        }
+        if (sync_epoch < last_confirmed_epoch) {
+            // La contabilidad de epochs no puede retroceder: seria imposible
+            // decidir que transferencias confirma esta sincronizacion.
+            lk.unlock();
+            enter_fail_stop(fail_reason::epoch_regression);
         }
         process_inflight_upto(sync_epoch);
 
@@ -604,6 +658,17 @@ struct llama_expert_source::impl {
             return;
         }
 
+        // Con la compuerta cerrada y programming_fills == 0, l2_inflight es el
+        // conjunto completo de transferencias no confirmadas. Si esta vacio no
+        // hay nada que sincronizar: no se contabiliza una sincronizacion.
+        if (l2_inflight.empty()) {
+            barrier_active = false;
+            gate_closed    = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
         ++sync_calls;
         const uint64_t sync_epoch = fill_epoch;
         lk.unlock();
@@ -615,6 +680,12 @@ struct llama_expert_source::impl {
             ++sync_failures;
             lk.unlock();
             enter_fail_stop(fail_reason::sync_failed);
+        }
+        if (sync_epoch < last_confirmed_epoch) {
+            // La contabilidad de epochs no puede retroceder: seria imposible
+            // decidir que transferencias confirma esta sincronizacion.
+            lk.unlock();
+            enter_fail_stop(fail_reason::epoch_regression);
         }
         process_inflight_upto(sync_epoch);
 
@@ -635,6 +706,12 @@ struct llama_expert_source::impl {
         std::unique_lock<std::mutex> lk(l2_mutex);
 
         if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
+            return;
+        }
+        if (sync_pending) {
+            // begin_sync() no es reentrante: cada begin_sync() debe emparejarse
+            // con su end_sync() antes de volver a llamarlo.
+            LLAMA_LOG_ERROR("nexus-expert-stream: begin_sync() with a synchronization already pending\n");
             return;
         }
         // Sin backend enlazado no hay transferencias que confirmar, y antes del
@@ -681,6 +758,13 @@ struct llama_expert_source::impl {
         }
         sync_pending = false;
 
+        if (sync_epoch_snapshot < last_confirmed_epoch) {
+            // La contabilidad de epochs no puede retroceder: seria imposible
+            // decidir que transferencias confirma esta sincronizacion.
+            lk.unlock();
+            enter_fail_stop(fail_reason::epoch_regression);
+        }
+
         ++sync_calls;
         process_inflight_upto(sync_epoch_snapshot);
 
@@ -704,10 +788,23 @@ struct llama_expert_source::impl {
         cv_idle.wait(lk, [&]{ return active_fills == 0; });
 
         if (barrier_active) {
-            // Otra hebra esta a mitad de barrera. La destruccion concurrente con
-            // uso del objeto es un error del llamante: no se usa _Exit (B1), se
-            // registra y se omite la sincronizacion final.
-            LLAMA_LOG_ERROR("nexus-expert-stream: teardown with an active barrier, skipping final sync\n");
+            // Otra hebra esta a mitad de una barrera (begin_sync() sin end_sync()).
+            // Puede haber programado una transferencia y estar fuera del mutex
+            // esperando al backend: cerrar la compuerta NO completa esa
+            // transferencia, y ggml_backend_synchronize() no informa su resultado.
+            // Politica explicita: la arena se retira sin liberarse (cuarentena)
+            // en vez de devolver memoria que el dispositivo puede estar leyendo.
+            // Destruir el objeto mientras otra hebra lo usa viola el contrato de
+            // vida util del llamante; el destructor no puede repararlo.
+            LLAMA_LOG_ERROR("nexus-expert-stream: teardown with an active barrier: "
+                            "the L2 arena is quarantined instead of freed\n");
+            quarantine_arena(fail_reason::lifetime_violation);
+            return;
+        }
+
+        // active_fills == 0 y l2_inflight solo cambia bajo l2_mutex: si esta
+        // vacio no queda ninguna transferencia programada sin confirmar.
+        if (l2_inflight.empty()) {
             return;
         }
 
@@ -719,12 +816,14 @@ struct llama_expert_source::impl {
 
         lk.lock();
         if (!sync_ok) {
-            // En teardown no se usa fail-stop: el proceso esta terminando y el
-            // backend se destruye a continuacion. Las transferencias no se marcan
-            // como confirmadas.
+            // No se puede demostrar que las transferencias pendientes terminaron.
+            // No se libera una arena que el dispositivo podria estar usando: se
+            // deja en cuarentena.
             ++sync_failures;
             fatal.store(true, std::memory_order_release);
-            LLAMA_LOG_ERROR("nexus-expert-stream: final synchronize failed during teardown\n");
+            LLAMA_LOG_ERROR("nexus-expert-stream: final synchronize failed during teardown: "
+                            "the L2 arena is quarantined instead of freed\n");
+            quarantine_arena(fail_reason::teardown_sync_failed);
             return;
         }
         process_inflight_upto(sync_epoch);
@@ -1112,6 +1211,14 @@ void llama_expert_source::on_layer_synchronized(int32_t il) {
 
 void llama_expert_source::synchronize_all() {
     pimpl->synchronize_external();
+}
+
+void llama_expert_source::drain() {
+    pimpl->drain_for_teardown();
+}
+
+bool llama_expert_source::was_arena_quarantined() const {
+    return pimpl->arena_quarantined.load(std::memory_order_acquire);
 }
 
 void llama_expert_source::begin_sync() {

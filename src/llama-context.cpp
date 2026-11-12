@@ -978,7 +978,20 @@ void llama_context::synchronize() {
         return;
     }
 
+    // Nexus: la sincronizacion del scheduler tambien cubre las transferencias de
+    // expertos programadas por el MoE cache. Se cierra la compuerta antes y se
+    // confirman despues, de modo que una transferencia marcada como confirmada
+    // corresponda a un backend realmente sincronizado y ninguna hebra programe
+    // durante la espera.
+    if (expert_source) {
+        expert_source->begin_sync();
+    }
+
     ggml_backend_sched_synchronize(sched.get());
+
+    if (expert_source) {
+        expert_source->end_sync();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats

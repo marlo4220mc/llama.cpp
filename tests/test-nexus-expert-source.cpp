@@ -1,11 +1,14 @@
 #include "../src/llama-expert-source.h"
 #include "../ggml/include/ggml-alloc.h"
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -456,6 +459,286 @@ static void test_two_phase_sync_and_teardown() {
     printf("[PASS] Two-phase sync, pread failure and teardown passed all tests.\n");
 }
 
+static ggml_tensor make_test_bank(ggml_backend_buffer_t buf, size_t bytes) {
+    ggml_tensor bank{};
+    bank.type = GGML_TYPE_I8;
+    bank.ne[0] = bytes;
+    bank.ne[1] = 1;
+    bank.ne[2] = 1;
+    bank.ne[3] = 1;
+    bank.nb[0] = 1;
+    bank.nb[1] = bytes;
+    bank.nb[2] = bytes;
+    bank.nb[3] = bytes;
+    bank.buffer = buf;
+    bank.data   = ggml_backend_buffer_get_base(buf);
+    return bank;
+}
+
+static void test_b2_sync_modes_and_teardown() {
+    printf("[TEST] Testing B2 sync modes, quiescence and teardown policies...\n");
+
+    llama_expert_model_meta meta;
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 2 * 1024 * 1024; // dos bloques de ~1 MB
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_b2_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t fake_file_size = 16 * 1024 * 1024;
+    TEST_CHECK(ftruncate(fd, fake_file_size) == 0, "ftruncate failed");
+    meta.files.push_back({ temp_path, fake_file_size });
+
+    ggml_tensor t_a{}, t_b{};
+    t_a.ne[2] = 4; t_a.nb[2] = 1000000;
+    t_b.ne[2] = 4; t_b.nb[2] = 1000000;
+    meta.tensors[&t_a] = { 0, 0,       1000000, 1000000, 4, true };
+    meta.tensors[&t_b] = { 0, 8000000, 1000000, 1000000, 4, true };
+
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    TEST_CHECK(cpu != nullptr, "failed to init the CPU backend");
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(ggml_backend_get_device(cpu));
+    ggml_backend_buffer_t bank_buf = ggml_backend_buft_alloc_buffer(cpu_buft, 2 * 1000000);
+    TEST_CHECK(bank_buf != nullptr, "failed to allocate the bank");
+    ggml_tensor bank = make_test_bank(bank_buf, 2 * 1000000);
+
+    // --- 1. UNKNOWN: una fuente sin ningun fill no tiene transferencias que
+    // confirmar; ni synchronize_all() ni drain() deben inventar un fallo.
+    {
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create (UNKNOWN) failed");
+        exsrc->synchronize_all();
+        TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 0,
+                   "a source with no transfers must not count a synchronization");
+        exsrc->drain();
+        TEST_CHECK(!exsrc->was_arena_quarantined(),
+                   "drain without transfers must not quarantine the arena");
+        TEST_CHECK(exsrc->get_arena_stats().sync_failures.load() == 0,
+                   "drain without transfers must not register a synchronization failure");
+        exsrc.reset();
+    }
+
+    // --- 2. HOST_ONLY: los fills no programan transferencias.
+    {
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create (HOST_ONLY) failed");
+        ggml_tensor dummy_bank{};
+        auto st = exsrc->fill_expert(nullptr, &dummy_bank, 0, &t_a, 0, 0, 1000000);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "HOST_ONLY fill failed");
+        TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 0,
+                   "HOST_ONLY must not program a transfer");
+        exsrc->synchronize_all();
+        TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 0,
+                   "HOST_ONLY synchronize_all must not call the backend");
+        exsrc->drain();
+        TEST_CHECK(!exsrc->was_arena_quarantined(),
+                   "HOST_ONLY drain must not quarantine the arena");
+        TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 0,
+                   "HOST_ONLY drain must not call the backend");
+        exsrc.reset();
+    }
+
+    // --- 3. CPU_SYNC: un bloque con transferencia pendiente no se reutiliza.
+    // Con la arena llena de expertos no confirmados y sus pins ya soltados, el
+    // siguiente fill solo puede tener exito si sincroniza antes de expulsar.
+    {
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create (CPU_SYNC) failed");
+
+        auto st = exsrc->fill_expert(cpu, &bank, 0, &t_a, 0, 0, 1000000);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill 0 failed");
+        st = exsrc->fill_expert(cpu, &bank, 0, &t_a, 1, 0, 1000000);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill 1 failed");
+        TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 2,
+                   "both transfers must be inflight before the synchronization");
+        TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 0,
+                   "no synchronization must be counted yet");
+
+        // los pins se sueltan, pero las transferencias no estan confirmadas
+        exsrc->on_layer_synchronized(0);
+
+        st = exsrc->fill_expert(cpu, &bank, 0, &t_a, 2, 0, 1000000);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill 2 after eviction failed");
+        TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 1,
+                   "the allocator must synchronize before reusing an unconfirmed block");
+        TEST_CHECK(exsrc->get_arena_stats().evictions.load() == 1,
+                   "exactly one block must be evicted");
+        TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 1,
+                   "only the new transfer may remain inflight");
+
+        exsrc->drain();
+        TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 0,
+                   "drain must confirm the last pending transfer");
+        TEST_CHECK(!exsrc->was_arena_quarantined(),
+                   "drain after a successful synchronization must free the arena");
+        st = exsrc->fill_expert(cpu, &bank, 0, &t_a, 3, 0, 1000000);
+        TEST_CHECK(st == llama_expert_fill_status::IO_ERROR,
+                   "a fill after drain must be rejected");
+        exsrc.reset();
+    }
+
+    // --- 4. Teardown con barrera activa (begin_sync sin end_sync): no se puede
+    // demostrar que el dispositivo dejo de leer la arena -> cuarentena.
+    {
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create (barrier) failed");
+        auto st = exsrc->fill_expert(cpu, &bank, 0, &t_a, 0, 0, 1000000);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill before the barrier failed");
+
+        exsrc->begin_sync(); // cierra la compuerta; el llamante no sincroniza
+        exsrc->drain();
+        TEST_CHECK(exsrc->was_arena_quarantined(),
+                   "drain with an active barrier must not free the arena");
+        TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 1,
+                   "drain with an active barrier must not fake a confirmation");
+        TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 0,
+                   "drain with an active barrier must not call the backend");
+
+        exsrc->end_sync(); // drain ya limpio sync_pending: no confirma nada
+        TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 1,
+                   "end_sync after drain must not confirm anything");
+        exsrc.reset(); // la arena esta en cuarentena: no se libera
+    }
+
+    // --- 5. Un fill que espera en la compuerta cuando empieza el teardown.
+    {
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create (gate wait) failed");
+        auto st = exsrc->fill_expert(cpu, &bank, 0, &t_a, 0, 0, 1000000);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill before the gate failed");
+
+        exsrc->begin_sync(); // compuerta cerrada
+
+        std::atomic<bool> about_to_fill{false};
+        llama_expert_fill_status worker_status = llama_expert_fill_status::LOADED;
+        std::thread worker([&]() {
+            about_to_fill.store(true, std::memory_order_release);
+            worker_status = exsrc->fill_expert(cpu, &bank, 0, &t_a, 1, 0, 1000000);
+        });
+        while (!about_to_fill.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+        exsrc->drain(); // cierra la compuerta y despierta al worker
+        worker.join();
+
+        TEST_CHECK(worker_status == llama_expert_fill_status::IO_ERROR,
+                   "a fill blocked on the gate must be rejected by the teardown");
+        TEST_CHECK(exsrc->was_arena_quarantined(),
+                   "drain with an active barrier must quarantine the arena");
+        exsrc.reset();
+    }
+
+    ggml_backend_buffer_free(bank_buf);
+    ggml_backend_free(cpu);
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] B2 sync modes, quiescence and teardown policies passed.\n");
+}
+
+static void test_callback_sync_vulkan() {
+    printf("[TEST] Testing CALLBACK_SYNC with a real Vulkan backend...\n");
+
+    ggml_backend_load_all();
+
+    ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_dev == nullptr) {
+        gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+    }
+    if (gpu_dev == nullptr) {
+        printf("[SKIP] no GPU/iGPU backend: CALLBACK_SYNC not exercised in this build\n");
+        return;
+    }
+
+    ggml_backend_t vk = ggml_backend_dev_init(gpu_dev, nullptr);
+    TEST_CHECK(vk != nullptr, "failed to init the GPU backend");
+    const char * vk_name = ggml_backend_name(vk);
+    if (vk_name == nullptr || strstr(vk_name, "Vulkan") == nullptr) {
+        printf("[SKIP] the GPU backend is not Vulkan (%s): CALLBACK_SYNC not exercised\n",
+               vk_name ? vk_name : "unknown");
+        ggml_backend_free(vk);
+        return;
+    }
+
+    const size_t expert_bytes = 1024 * 1024;
+    const size_t file_size    = 4 * expert_bytes;
+
+    char temp_path[] = "/tmp/test_nexus_vk_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    std::vector<uint8_t> pattern(expert_bytes);
+    for (size_t i = 0; i < expert_bytes; ++i) {
+        pattern[i] = (uint8_t) (i % 251);
+    }
+    TEST_CHECK(pwrite(fd, pattern.data(), expert_bytes, 0) == (ssize_t) expert_bytes, "pwrite failed");
+    TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+
+    llama_expert_model_meta meta;
+    meta.files.push_back({ temp_path, file_size });
+    ggml_tensor t{};
+    t.ne[2] = 4; t.nb[2] = expert_bytes;
+    meta.tensors[&t] = { 0, 0, expert_bytes, expert_bytes, 4, true };
+
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 4 * expert_bytes;
+    cfg.alignment      = 64;
+
+    auto exsrc = llama_expert_source::create(meta, cfg);
+    TEST_CHECK(exsrc != nullptr, "create (Vulkan) failed");
+
+    // el banco es memoria de dispositivo, como en el MoE cache real
+    ggml_backend_buffer_type_t dev_buft = ggml_backend_get_default_buffer_type(vk);
+    ggml_backend_buffer_t bank_buf = ggml_backend_buft_alloc_buffer(dev_buft, 2 * expert_bytes);
+    TEST_CHECK(bank_buf != nullptr, "failed to allocate the device bank");
+    ggml_tensor bank = make_test_bank(bank_buf, 2 * expert_bytes);
+
+    auto st = exsrc->fill_expert(vk, &bank, 0, &t, 0, 0, expert_bytes);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "fill through the Vulkan backend failed");
+
+    const auto kind = exsrc->get_l2_mem_kind();
+    printf("  L2 memory kind: %s\n",
+           kind == llama_expert_mem_kind::PINNED_VK ? "PINNED_VK" :
+           (kind == llama_expert_mem_kind::PAGEABLE_HOST_FALLBACK ? "PAGEABLE_HOST_FALLBACK" : "PAGEABLE_HOST"));
+    TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 1,
+               "the Vulkan transfer must be inflight until confirmed");
+
+    exsrc->begin_sync();
+    ggml_backend_synchronize(vk);
+    exsrc->end_sync();
+    TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 0,
+               "end_sync must confirm the Vulkan transfer");
+    TEST_CHECK(exsrc->get_arena_stats().sync_calls.load() == 1,
+               "end_sync must count exactly one synchronization");
+
+    // la transferencia se emitio por el backend Vulkan y, tras sincronizar, los
+    // bytes del experto estan en el banco
+    std::vector<uint8_t> out(expert_bytes);
+    ggml_backend_tensor_get(&bank, out.data(), 0, expert_bytes);
+    TEST_CHECK(memcmp(out.data(), pattern.data(), expert_bytes) == 0,
+               "the expert bytes did not reach the bank after the Vulkan transfer");
+
+    // transferencia pendiente al iniciar el teardown: drain la confirma
+    st = exsrc->fill_expert(vk, &bank, 0, &t, 1, 0, expert_bytes);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "second Vulkan fill failed");
+    exsrc->drain();
+    TEST_CHECK(!exsrc->was_arena_quarantined(),
+               "drain must free the arena after confirming the Vulkan transfer");
+    TEST_CHECK(exsrc->get_arena_stats().blocks_inflight.load() == 0,
+               "drain must confirm the pending Vulkan transfer");
+    st = exsrc->fill_expert(vk, &bank, 0, &t, 2, 0, expert_bytes);
+    TEST_CHECK(st == llama_expert_fill_status::IO_ERROR, "fill after drain must be rejected");
+
+    exsrc.reset();
+    ggml_backend_buffer_free(bank_buf);
+    ggml_backend_free(vk);
+
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] CALLBACK_SYNC with the Vulkan backend passed.\n");
+}
+
 struct sched_abort_state {
     ggml_backend_sched_t sched = nullptr;
     bool invoked = false;
@@ -552,6 +835,8 @@ int main() {
     test_concurrency_and_barrier_quiescence();
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();
+    test_b2_sync_modes_and_teardown();
+    test_callback_sync_vulkan();
     test_sched_abort_from_copy_callback();
     printf("=== ALL NEXUS EXPERT SOURCE TESTS PASSED ===\n");
     return 0;
