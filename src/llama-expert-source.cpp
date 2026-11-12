@@ -193,8 +193,20 @@ enum class fail_reason {
     inflight_without_block,
     inflight_underflow,
     residual_inflight,
-    lifetime_violation
+    lifetime_violation,
+    rollback_failed
 };
+
+// NOTA DE GARANTIA (D-1.6.2, objetivo D): std::map::extract(const_iterator) y
+// std::map::insert(node_type&&) NO estan marcados noexcept por libstdc++ (los
+// static_assert de esta garantia fallan), por lo que no se afirma "noexcept".
+// La no-lanzabilidad en la practica se apoya en dos hechos concretos para
+// std::map<size_t,size_t>:
+//   1. el comparador std::less<size_t>::operator() es noexcept;
+//   2. extract no asigna y insert(node_type&&) reutiliza el nodo ya asignado,
+//      sin reservar memoria nueva.
+// Aun asi, restore_alloc() y las rutas de rollback verifican el retorno y, ante
+// un fallo teorico, aplican la politica de fallo seguro (quarantena + fatal).
 
 struct quarantine_node {
     ggml_backend_buffer_t arena_buf   = nullptr;
@@ -527,7 +539,14 @@ struct llama_expert_source::impl {
     // Allocator First-Fit. Las mutaciones de free_holes usan extract()/insert()
     // con node_type, que no asignan: un bad_alloc nunca deja el allocator a
     // medio modificar.
-    bool alloc_block(size_t req_bytes, size_t & out_offset, size_t & out_size, size_t & out_slack) {
+    //
+    // Si el hueco se consume por completo (rem < alignment, incluido rem == 0),
+    // el nodo extraido conserva el hueco original y se entrega via
+    // out_restore_node: el llamante lo sostiene durante la publicacion del
+    // bloque para que el rollback pueda reinsertarlo sin asignar. Si deja un
+    // remainder (rem >= alignment), el rollback se fusiona con el (no-throw).
+    bool alloc_block(size_t req_bytes, size_t & out_offset, size_t & out_size, size_t & out_slack,
+                     std::map<size_t, size_t>::node_type * out_restore_node = nullptr) {
         size_t req = 0;
         if (!safe_align_up(req_bytes, alignment, req)) {
             return false;
@@ -542,7 +561,7 @@ struct llama_expert_source::impl {
                 out_offset = h_offset;
                 out_size   = req;
 
-                auto node = free_holes.extract(it); // noexcept
+                auto node = free_holes.extract(it); // noexcept en la practica
                 if (rem == 0) {
                     out_slack = 0;
                 } else if (rem < alignment) {
@@ -551,7 +570,28 @@ struct llama_expert_source::impl {
                     out_slack = 0;
                     node.key()    = h_offset + req;
                     node.mapped() = rem;
-                    free_holes.insert(std::move(node)); // sin asignacion: noexcept
+                    // En la practica no puede lanzar (comparador noexcept, sin
+                    // asignacion); si ocurriera, se restaura el hueco original
+                    // para no perder capacidad y se devuelve false.
+                    try {
+                        free_holes.insert(std::move(node));
+                    } catch (...) {
+                        if (node) {
+                            try {
+                                free_holes.emplace(node.key(), node.mapped());
+                            } catch (...) {
+                                // doble fallo: el hueco se pierde (documentado)
+                            }
+                        }
+                        return false;
+                    }
+                }
+
+                // rem < alignment: el hueco se consumio por completo y el nodo
+                // extraido sigue con los valores originales. Se entrega como
+                // respaldo de rollback si el llamante lo pide.
+                if ((rem == 0 || rem < alignment) && out_restore_node != nullptr) {
+                    *out_restore_node = std::move(node);
                 }
 
                 aligned_bytes += out_size;
@@ -561,6 +601,28 @@ struct llama_expert_source::impl {
             }
         }
         return false;
+    }
+
+    // Rollback de una region asignada por alloc_block que no llego a publicarse.
+    // Si alloc_block dejo un remainder (rem >= alignment), se llama free_block
+    // que se fusiona con el. Si consumio el hueco completo, se reinserta el nodo
+    // retenido. En la practica ninguna ruta lanza (comparador noexcept, sin
+    // asignacion); de ocurrir, se devuelve false y el llamante aplica la
+    // politica de fallo seguro.
+    bool restore_alloc(size_t offset, size_t size, size_t slack,
+                       std::map<size_t, size_t>::node_type node) {
+        if (node) {
+            try {
+                free_holes.insert(std::move(node));
+            } catch (...) {
+                return false;
+            }
+            aligned_bytes -= size;
+            slack_bytes   -= slack;
+            free_bytes    += (size + slack);
+            return true;
+        }
+        return free_block(offset, size, slack); // caso merge
     }
 
     // Libera [offset, size+slack) de vuelta a free_holes. Devuelve true solo si
@@ -610,6 +672,19 @@ struct llama_expert_source::impl {
         } else {
             // Hueco completamente nuevo: unica operacion asignadora. Se intenta
             // antes de tocar contadores; un fallo no modifica nada.
+            // Defensivo (imposible en operacion normal): rechazar doble
+            // liberacion o solapamiento con huecos existentes.
+            auto hole_check = free_holes.lower_bound(offset);
+            if (hole_check != free_holes.end() && hole_check->first == offset) {
+                return false; // doble liberacion exacta de la misma region
+            }
+            auto prev_check = (hole_check != free_holes.begin()) ? std::prev(hole_check) : free_holes.end();
+            if (prev_check != free_holes.end() && prev_check->first + prev_check->second > offset) {
+                return false; // solapamiento con el hueco anterior
+            }
+            if (hole_check != free_holes.end() && offset + total > hole_check->first) {
+                return false; // solapamiento con el hueco siguiente
+            }
             try {
 #if defined(GGML_NEXUS_TEST_HOOKS)
                 // inyeccion TEST-ONLY: el bad_alloc real se lanza DENTRO del try,
@@ -1464,7 +1539,11 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
         p.stats.l2_misses++;
         is_loader = true;
 
-        while (!p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk)) {
+        // Nodo retenido durante la publicacion: si alloc_block consume un hueco
+        // completo, este nodo permite un rollback no-throw (reinsert sin asignar).
+        std::map<size_t, size_t>::node_type restore_node;
+
+        while (!p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk, &restore_node)) {
             if (!p.evict_lru_victim()) {
                 lk.unlock();
                 p.synchronize_active_fill();
@@ -1487,7 +1566,13 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
         if (alloc_off > p.arena_bytes || alloc_sz > p.arena_bytes - alloc_off ||
             expert_size > alloc_sz) {
             p.alloc_fail++;
-            if (!p.free_block(alloc_off, alloc_sz, alloc_slk)) {
+            if (!p.restore_alloc(alloc_off, alloc_sz, alloc_slk, std::move(restore_node))) {
+                // Politica de fallo seguro: no se continua con una region sin
+                // propietario; la arena se retira y la fuente queda fatal.
+                LLAMA_LOG_ERROR("nexus-expert-stream: rollback failed after an invalid extent, "
+                                "quarantining the arena\n");
+                p.fatal.store(true, std::memory_order_release);
+                p.quarantine_arena(fail_reason::rollback_failed);
                 return llama_expert_fill_status::OUT_OF_MEMORY;
             }
             return llama_expert_fill_status::INVALID_EXTENT;
@@ -1504,15 +1589,33 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
         blk.lru_tick   = ++p.current_lru_tick;
 
         try {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+            // inyeccion TEST-ONLY: fallo del nodo LRU en el punto real de la
+            // publicacion; el catch aplica restore_alloc (no-throw).
+            if (nexus_test_fail_alloc()) {
+                throw std::bad_alloc();
+            }
+#endif
             p.l2_lru_list.push_front(key);
             blk.lru_it = p.l2_lru_list.begin();
+#if defined(GGML_NEXUS_TEST_HOOKS)
+            // inyeccion TEST-ONLY: fallo del nodo del indice en el punto real.
+            if (nexus_test_fail_alloc()) {
+                throw std::bad_alloc();
+            }
+#endif
             const auto inserted = p.l2_index.emplace(key, blk);
             if (!inserted.second) {
                 // Inalcanzable bajo el mismo mutex (la clave no existia al mirar),
                 // pero se mantiene como red de seguridad: restaurar y continuar.
                 p.l2_lru_list.erase(blk.lru_it);
                 p.alloc_fail++;
-                if (!p.free_block(alloc_off, alloc_sz, alloc_slk)) {
+                if (!p.restore_alloc(alloc_off, alloc_sz, alloc_slk, std::move(restore_node))) {
+                    // Politica de fallo seguro ante un rollback imposible.
+                    LLAMA_LOG_ERROR("nexus-expert-stream: rollback failed after a duplicate key, "
+                                    "quarantining the arena\n");
+                    p.fatal.store(true, std::memory_order_release);
+                    p.quarantine_arena(fail_reason::rollback_failed);
                     return llama_expert_fill_status::OUT_OF_MEMORY;
                 }
                 is_loader = false;
@@ -1520,24 +1623,33 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
                 continue;
             }
         } catch (const std::bad_alloc &) {
-            // El hueco y los contadores se restauran antes de propagar al
-            // wrapper C-safe; no queda una clave parcialmente publicada.
+            // El hueco y los contadores se restauran (restore_alloc es no-throw);
+            // no queda una clave parcialmente publicada ni una region huerfana.
             if (!p.l2_lru_list.empty() && p.l2_lru_list.front().layer_id == key.layer_id &&
                 p.l2_lru_list.front().tensor_id == key.tensor_id &&
                 p.l2_lru_list.front().expert_id == key.expert_id) {
                 p.l2_lru_list.pop_front();
             }
-            p.free_block(alloc_off, alloc_sz, alloc_slk);
+            if (!p.restore_alloc(alloc_off, alloc_sz, alloc_slk, std::move(restore_node))) {
+                LLAMA_LOG_ERROR("nexus-expert-stream: rollback failed after an allocation failure, "
+                                "quarantining the arena\n");
+                p.fatal.store(true, std::memory_order_release);
+                p.quarantine_arena(fail_reason::rollback_failed);
+            }
             return llama_expert_fill_status::OUT_OF_MEMORY;
         } catch (...) {
-            // El hueco y los contadores se restauran antes de propagar al
-            // wrapper C-safe; no queda una clave parcialmente publicada.
+            // Mismo rollback no-throw para cualquier otra excepcion de publicacion.
             if (!p.l2_lru_list.empty() && p.l2_lru_list.front().layer_id == key.layer_id &&
                 p.l2_lru_list.front().tensor_id == key.tensor_id &&
                 p.l2_lru_list.front().expert_id == key.expert_id) {
                 p.l2_lru_list.pop_front();
             }
-            p.free_block(alloc_off, alloc_sz, alloc_slk);
+            if (!p.restore_alloc(alloc_off, alloc_sz, alloc_slk, std::move(restore_node))) {
+                LLAMA_LOG_ERROR("nexus-expert-stream: rollback failed after an unexpected exception, "
+                                "quarantining the arena\n");
+                p.fatal.store(true, std::memory_order_release);
+                p.quarantine_arena(fail_reason::rollback_failed);
+            }
             return llama_expert_fill_status::OUT_OF_MEMORY;
         }
         blk_offset = alloc_off;

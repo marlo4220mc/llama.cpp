@@ -37,6 +37,146 @@ static int count_open_fds() {
     return n;
 }
 
+static void test_d162_publication_rollback() {
+    printf("[TEST] Testing D-1.6.2 publication rollback after allocation failures...\n");
+
+    llama_expert_model_meta meta;
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 4 * 1024 * 1024;
+    cfg.alignment      = 64;
+
+    char temp_path[] = "/tmp/test_nexus_d162_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t file_size = 32 * 1024 * 1024;
+    TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+    meta.files.push_back({ temp_path, file_size });
+
+    ggml_tensor t{};
+    t.ne[2] = 16;
+    t.nb[2] = 1024 * 1024;
+    meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 16, true,
+                         0, llama_expert_tensor_role::GATE_UP,
+                         llama_expert_tensor_validation::VALID };
+
+    const size_t MB = 1024 * 1024;
+    ggml_tensor dummy_bank{};
+
+    auto inv_ok = [&](llama_expert_source * es) {
+        const auto & s = es->get_arena_stats();
+        return s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load();
+    };
+
+    // 1. Fallo de l2_lru_list.push_front con rollback por FUSION (existe vecino
+    // libre: el remainder dejado por alloc_block). Sin region huerfana.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "seed fill failed");
+
+        // La primera llamada al hook en un miss sin eviction es push_front.
+        llama_expert_source::test_arm_alloc_failure(0);
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 1, 0, MB);
+        llama_expert_source::test_disarm_alloc_failure();
+
+        TEST_CHECK(st == llama_expert_fill_status::OUT_OF_MEMORY,
+                   "push_front failure must surface as OUT_OF_MEMORY");
+        TEST_CHECK(inv_ok(es.get()), "invariant must hold after push_front failure");
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == 3 * MB,
+                   "the merge rollback must return the whole hole");
+        TEST_CHECK(es->get_arena_stats().blocks_live.load() == 1,
+                   "no block may be published after a failed publication");
+
+        // Recuperacion: la misma asignacion ahora tiene exito.
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 1, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "recovery fill failed");
+        TEST_CHECK(inv_ok(es.get()), "invariant must hold after recovery");
+
+        // Repeticion: llenar y evictar varias veces tras la recuperacion.
+        for (int e = 2; e <= 8; ++e) {
+            es->on_layer_synchronized(0); // despinne los bloques de la capa 0
+            st = es->fill_expert(nullptr, &dummy_bank, 0, &t, e, 0, MB);
+            TEST_CHECK(st == llama_expert_fill_status::LOADED, "repeat fill failed");
+        }
+        TEST_CHECK(es->get_arena_stats().evictions.load() >= 3,
+                   "evictions must work after recovery");
+        TEST_CHECK(inv_ok(es.get()), "invariant must hold after repeated fills");
+
+        es->drain();
+        TEST_CHECK(!es->was_arena_quarantined(), "drain must free the arena normally");
+        es.reset();
+    }
+
+    // 2. Fallo de l2_lru_list.push_front con rollback por NODO RETENIDO (sin
+    // vecino libre: el alloc consumio el ultimo hueco completo).
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        for (int e = 0; e < 3; ++e) {
+            auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, e, 0, MB);
+            TEST_CHECK(st == llama_expert_fill_status::LOADED, "seed fill failed");
+        }
+        // Queda un unico hueco de exactamente 1 MiB en [3MiB,4MiB).
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == MB, "arena must have one hole left");
+
+        llama_expert_source::test_arm_alloc_failure(0);
+        auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 3, 0, MB);
+        llama_expert_source::test_disarm_alloc_failure();
+
+        TEST_CHECK(st == llama_expert_fill_status::OUT_OF_MEMORY,
+                   "push_front failure on a whole-hole alloc must be OOM");
+        TEST_CHECK(inv_ok(es.get()), "invariant must hold after held-node rollback");
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == MB,
+                   "the held node must return the whole consumed hole");
+        TEST_CHECK(es->get_arena_stats().blocks_live.load() == 3,
+                   "no fourth block may be published");
+
+        // Recuperacion.
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 3, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "recovery fill failed");
+        TEST_CHECK(inv_ok(es.get()), "invariant after recovery");
+
+        es->drain();
+        es.reset();
+    }
+
+    // 3. Fallo de l2_index.emplace (push_front ya publicado): el catch debe
+    // despublicar la clave de la LRU y restaurar la region.
+    {
+        auto es = llama_expert_source::create(meta, cfg).source;
+        TEST_CHECK(es != nullptr, "create failed");
+        auto st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "seed fill failed");
+
+        // Segunda llamada al hook = emplace.
+        llama_expert_source::test_arm_alloc_failure(1);
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 1, 0, MB);
+        llama_expert_source::test_disarm_alloc_failure();
+
+        TEST_CHECK(st == llama_expert_fill_status::OUT_OF_MEMORY,
+                   "emplace failure must surface as OUT_OF_MEMORY");
+        TEST_CHECK(inv_ok(es.get()), "invariant must hold after emplace failure");
+        TEST_CHECK(es->get_arena_stats().free_bytes.load() == 3 * MB,
+                   "the rollback must return the hole after emplace failure");
+        TEST_CHECK(es->get_arena_stats().blocks_live.load() == 1,
+                   "no block may remain published after emplace failure");
+
+        // Recuperacion y uso normal.
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 1, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "recovery fill failed");
+        st = es->fill_expert(nullptr, &dummy_bank, 0, &t, 2, 0, MB);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "second recovery fill failed");
+
+        es->drain();
+        es.reset();
+    }
+
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] D-1.6.2 publication rollback passed.\n");
+}
+
 static void test_d161_transactional_allocator() {
     printf("[TEST] Testing D-1.6.1 transactional allocator and real bad_alloc paths...\n");
 
@@ -1673,6 +1813,7 @@ int main() {
     test_blocker_c_alignment_transaction();
 #if defined(GGML_NEXUS_TEST_HOOKS)
     test_d161_transactional_allocator();
+    test_d162_publication_rollback();
 #endif
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();
