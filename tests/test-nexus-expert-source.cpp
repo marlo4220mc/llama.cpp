@@ -821,6 +821,79 @@ static void test_b4_tensor_identity() {
     printf("[PASS] B4 explicit tensor identity passed.\n");
 }
 
+static void test_b5_statistics() {
+    printf("[TEST] Testing B5 statistics accounting and reset...\n");
+
+    llama_expert_model_meta meta;
+    char temp_path[] = "/tmp/test_nexus_b5_XXXXXX";
+    int fd = mkstemp(temp_path);
+    TEST_CHECK(fd >= 0, "mkstemp failed");
+    const size_t expert_bytes = 1024 * 1024;
+    TEST_CHECK(ftruncate(fd, 4 * expert_bytes) == 0, "ftruncate failed");
+    meta.files.push_back({ temp_path, 4 * expert_bytes });
+
+    ggml_tensor t{};
+    t.ne[2] = 4;
+    t.nb[2] = expert_bytes;
+    meta.tensors[&t] = { 0, 0, expert_bytes, expert_bytes, 4, true };
+
+    llama_expert_source::config cfg;
+    cfg.ram_warm_bytes = 2 * expert_bytes;
+    auto exsrc = llama_expert_source::create(meta, cfg);
+    TEST_CHECK(exsrc != nullptr, "create failed");
+
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    TEST_CHECK(cpu != nullptr, "failed to init CPU backend");
+    auto buft = ggml_backend_dev_buffer_type(ggml_backend_get_device(cpu));
+    auto bank_buf = ggml_backend_buft_alloc_buffer(buft, expert_bytes);
+    TEST_CHECK(bank_buf != nullptr, "failed to allocate bank");
+    ggml_tensor bank = make_test_bank(bank_buf, expert_bytes);
+
+    auto st = exsrc->fill_expert(cpu, &bank, 0, &t, 0, 0, expert_bytes);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "first statistics fill failed");
+    st = exsrc->fill_expert(cpu, &bank, 0, &t, 0, 0, expert_bytes);
+    TEST_CHECK(st == llama_expert_fill_status::LOADED, "L2 hit statistics fill failed");
+    exsrc->begin_sync();
+    ggml_backend_synchronize(cpu);
+    exsrc->end_sync();
+
+    const auto & stats = exsrc->get_stats();
+    auto & mutable_stats = const_cast<llama_expert_stats &>(stats);
+    TEST_CHECK(stats.fills.load() == 2, "fills must count successful fills");
+    TEST_CHECK(stats.l2_misses.load() == 1 && stats.l2_hits.load() == 1,
+               "L2 hit/miss counters must be separated");
+    TEST_CHECK(stats.proc_bytes.load() == expert_bytes,
+               "proc_bytes must count only the NVMe read");
+    TEST_CHECK(stats.upload_bytes.load() == 2 * expert_bytes,
+               "upload_bytes must count both device uploads");
+    TEST_CHECK(stats.io_us_total.load() >= 0, "io timing counter must be readable");
+
+    // Los contadores de rutas alternativas se prueban directamente para que el
+    // test no dependa de fabricar mmap/capacidad insuficiente en el fixture.
+    mutable_stats.record(llama_expert_fill_status::FALLBACK_ALLOWED);
+    mutable_stats.record(llama_expert_fill_status::NOT_SUPPORTED);
+    mutable_stats.record(llama_expert_fill_status::OUT_OF_MEMORY);
+    mutable_stats.record(llama_expert_fill_status::IO_ERROR);
+    mutable_stats.record(llama_expert_fill_status::INVALID_EXTENT);
+    TEST_CHECK(stats.fallback_mmap.load() == 1 && stats.not_supported.load() == 1 &&
+               stats.out_of_memory.load() == 1 && stats.rejected_io.load() == 1 &&
+               stats.rejected_invalid.load() == 1,
+               "rejected/fallback routes must have separate counters");
+
+    mutable_stats.reset();
+    TEST_CHECK(stats.fills.load() == 0 && stats.l2_hits.load() == 0 &&
+               stats.upload_bytes.load() == 0 && stats.rejected_invalid.load() == 0,
+               "reset must clear every B5 counter");
+
+    exsrc->drain();
+    exsrc.reset();
+    ggml_backend_buffer_free(bank_buf);
+    ggml_backend_free(cpu);
+    close(fd);
+    unlink(temp_path);
+    printf("[PASS] B5 statistics accounting and reset passed.\n");
+}
+
 static void test_callback_sync_vulkan() {
     printf("[TEST] Testing CALLBACK_SYNC with a real Vulkan backend...\n");
 
@@ -1021,6 +1094,7 @@ int main() {
     test_b2_sync_modes_and_teardown();
     test_b3_metadata_validation();
     test_b4_tensor_identity();
+    test_b5_statistics();
     test_callback_sync_vulkan();
     test_sched_abort_from_copy_callback();
     printf("=== ALL NEXUS EXPERT SOURCE TESTS PASSED ===\n");

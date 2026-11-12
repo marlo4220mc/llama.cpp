@@ -70,28 +70,69 @@ int64_t llama_expert_pread_full(int fd, void * buf, size_t count, uint64_t offse
     return (int64_t) total_read;
 }
 
+void llama_expert_stats::record(llama_expert_fill_status st) {
+    switch (st) {
+        case llama_expert_fill_status::LOADED:
+            // ya contabilizado como fill en el camino de exito
+            break;
+        case llama_expert_fill_status::FALLBACK_ALLOWED:
+            fallback_mmap.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case llama_expert_fill_status::NOT_SUPPORTED:
+            not_supported.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case llama_expert_fill_status::OUT_OF_MEMORY:
+            out_of_memory.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case llama_expert_fill_status::IO_ERROR:
+            rejected_io.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case llama_expert_fill_status::INVALID_EXTENT:
+            rejected_invalid.fetch_add(1, std::memory_order_relaxed);
+            break;
+    }
+}
+
 void llama_expert_stats::log(const char * tag) const {
-    const uint64_t total = fills.load();
-    if (total == 0) {
+    const uint64_t total     = fills.load();
+    const uint64_t l2_h      = l2_hits.load();
+    const uint64_t l2_m      = l2_misses.load();
+    const uint64_t bytes     = proc_bytes.load();
+    const uint64_t uploaded  = upload_bytes.load();
+    const uint64_t us        = io_us_total.load();
+    const uint64_t max_u     = io_us_max.load();
+    const uint64_t fallback  = fallback_mmap.load();
+    const uint64_t not_sup   = not_supported.load();
+    const uint64_t oom       = out_of_memory.load();
+    const uint64_t rej_io    = rejected_io.load();
+    const uint64_t rej_inv   = rejected_invalid.load();
+
+    if (total == 0 && l2_h == 0 && l2_m == 0 && fallback == 0 && not_sup == 0 &&
+        oom == 0 && rej_io == 0 && rej_inv == 0) {
         return;
     }
-    const uint64_t l2_h  = l2_hits.load();
-    const uint64_t l2_m  = l2_misses.load();
-    const uint64_t bytes = proc_bytes.load();
-    const uint64_t us    = io_us_total.load();
-    const uint64_t max_u = io_us_max.load();
-    const double avg_us  = (l2_m > 0) ? (double) us / l2_m : 0.0;
-    const double mb      = (double) bytes / (1024.0 * 1024.0);
-    const double thr     = (us > 0) ? (mb / ((double) us / 1000000.0)) : 0.0;
+
+    // El hit rate de L2 se calcula sobre las consultas a la arena (hits + misses),
+    // no sobre `fills`: los fills rechazados o en fallback no consultaron L2.
+    // Los aciertos de L1 (banco del dispositivo) los reporta llama_moe_cache.
+    const uint64_t lookups  = l2_h + l2_m;
+    const double   hit_rate = lookups > 0 ? 100.0 * (double) l2_h / (double) lookups : 0.0;
+    const double   avg_us   = l2_m > 0 ? (double) us / (double) l2_m : 0.0;
+    const double   mb       = (double) bytes / (1024.0 * 1024.0);
+    const double   up_mb    = (double) uploaded / (1024.0 * 1024.0);
+    const double   thr      = us > 0 ? mb / ((double) us / 1000000.0) : 0.0;
 
     LLAMA_LOG_INFO(
-        "nexus-expert-stream [%s]: fills=%lu (L2 hit=%lu miss=%lu | hit_rate=%.1f%%) | NVMe: %.2f MiB, avg=%.1f us, max=%lu us (%.2f MiB/s)\n",
-        tag,
-        (unsigned long) total,
-        (unsigned long) l2_h,
-        (unsigned long) l2_m,
-        100.0 * (double) l2_h / (double) total,
-        mb, avg_us, (unsigned long) max_u, thr);
+        "nexus-expert-stream [%s]: fills=%lu | L2: hit=%lu miss=%lu (hit_rate=%.1f%%)\n",
+        tag, (unsigned long) total, (unsigned long) l2_h, (unsigned long) l2_m, hit_rate);
+    LLAMA_LOG_INFO(
+        "nexus-expert-stream [%s]: NVMe: %.2f MiB in %lu reads, avg=%.1f us, max=%lu us (%.2f MiB/s) | uploaded: %.2f MiB\n",
+        tag, mb, (unsigned long) l2_m, avg_us, (unsigned long) max_u, thr, up_mb);
+    LLAMA_LOG_INFO(
+        "nexus-expert-stream [%s]: fallback mmap=%lu not_supported=%lu oom=%lu rejected_io=%lu rejected_invalid=%lu | drops=%lu verify ok=%lu fail=%lu\n",
+        tag, (unsigned long) fallback, (unsigned long) not_sup, (unsigned long) oom,
+        (unsigned long) rej_io, (unsigned long) rej_inv,
+        (unsigned long) drops.load(), (unsigned long) verify_ok.load(), (unsigned long) verify_fail.load());
 }
 
 void llama_expert_stats::reset() {
@@ -99,8 +140,14 @@ void llama_expert_stats::reset() {
     l2_hits.store(0);
     l2_misses.store(0);
     proc_bytes.store(0);
+    upload_bytes.store(0);
     io_us_total.store(0);
     io_us_max.store(0);
+    fallback_mmap.store(0);
+    not_supported.store(0);
+    out_of_memory.store(0);
+    rejected_io.store(0);
+    rejected_invalid.store(0);
     drops.store(0);
     verify_ok.store(0);
     verify_fail.store(0);
@@ -998,7 +1045,7 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
 
 llama_expert_source::~llama_expert_source() = default;
 
-llama_expert_fill_status llama_expert_source::fill_expert(
+llama_expert_fill_status llama_expert_source::fill_expert_impl(
         ggml_backend_t backend,
         ggml_tensor * bank,
         int32_t il,
@@ -1290,9 +1337,25 @@ llama_expert_fill_status llama_expert_source::fill_expert(
 
         void * src_ptr = static_cast<uint8_t *>(p.arena_base) + blk_offset;
         ggml_backend_tensor_set_async(backend, bank, src_ptr, slot_offset, expert_size);
+        p.stats.upload_bytes.fetch_add(expert_size, std::memory_order_relaxed);
     }
 
     return llama_expert_fill_status::LOADED;
+}
+
+llama_expert_fill_status llama_expert_source::fill_expert(
+        ggml_backend_t backend,
+        ggml_tensor * bank,
+        int32_t il,
+        const ggml_tensor * w,
+        int32_t expert,
+        size_t slot_offset,
+        size_t expert_size) {
+    const auto status = fill_expert_impl(backend, bank, il, w, expert, slot_offset, expert_size);
+    if (status != llama_expert_fill_status::LOADED) {
+        pimpl->stats.record(status);
+    }
+    return status;
 }
 
 void llama_expert_source::on_layer_synchronized(int32_t il) {

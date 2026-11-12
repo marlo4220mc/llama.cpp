@@ -121,16 +121,35 @@ struct llama_expert_arena_stats {
     std::atomic<uint64_t> oom_rejects     { 0 };
 };
 
+// Estadisticas de la fuente de expertos (rutas L2/NVMe y motivos de rechazo).
+//
+// Alcance deliberadamente limitado:
+//   - `l2_hits` / `l2_misses` son los aciertos y fallos de la arena L2 en RAM.
+//     Los aciertos de L1 (experto ya presente en el banco del dispositivo) los
+//     contabiliza `llama_moe_cache`; aqui no se ven y no entran en `hit_rate`.
+//   - `io_us_*` mide SOLO el tiempo de `pread` desde NVMe. No incluye la
+//     programacion ni la espera de la transferencia al dispositivo.
+//   - `upload_bytes` son los bytes efectivamente programados hacia el banco del
+//     dispositivo; un fill en modo host (sin backend) no suma aqui.
 struct llama_expert_stats {
-    std::atomic<uint64_t> fills          { 0 };
-    std::atomic<uint64_t> l2_hits        { 0 };
-    std::atomic<uint64_t> l2_misses      { 0 };
-    std::atomic<uint64_t> proc_bytes     { 0 };
-    std::atomic<uint64_t> io_us_total    { 0 };
-    std::atomic<uint64_t> io_us_max      { 0 };
+    std::atomic<uint64_t> fills          { 0 }; // fills aceptados (pasaron la validacion de extent)
+    std::atomic<uint64_t> l2_hits        { 0 }; // experto ya RESIDENT en la arena L2
+    std::atomic<uint64_t> l2_misses      { 0 }; // experto que hubo que leer de NVMe
+    std::atomic<uint64_t> proc_bytes     { 0 }; // bytes leidos de NVMe
+    std::atomic<uint64_t> upload_bytes   { 0 }; // bytes programados al banco del dispositivo
+    std::atomic<uint64_t> io_us_total    { 0 }; // tiempo acumulado de pread (solo pread)
+    std::atomic<uint64_t> io_us_max      { 0 }; // mayor pread individual
+    std::atomic<uint64_t> fallback_mmap  { 0 }; // FALLBACK_ALLOWED: el llamante lee de w->data
+    std::atomic<uint64_t> not_supported  { 0 }; // NOT_SUPPORTED: extent valido pero no streameable
+    std::atomic<uint64_t> out_of_memory  { 0 }; // OUT_OF_MEMORY: no cabe en L2 ni expulsando
+    std::atomic<uint64_t> rejected_io    { 0 }; // IO_ERROR: pread fallido o fuente que no acepta fills
+    std::atomic<uint64_t> rejected_invalid { 0 }; // INVALID_EXTENT: metadatos/offsets/slot invalidos
     std::atomic<uint64_t> drops          { 0 };
     std::atomic<uint64_t> verify_ok      { 0 };
     std::atomic<uint64_t> verify_fail    { 0 };
+
+    // Contabiliza el resultado de un fill que no llego a LOADED.
+    void record(llama_expert_fill_status st);
 
     void log(const char * tag) const;
     void reset();
@@ -244,4 +263,14 @@ public:
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // Cuerpo de fill_expert(); el envoltorio publico contabiliza el resultado.
+    llama_expert_fill_status fill_expert_impl(
+        ggml_backend_t backend,
+        ggml_tensor * bank,
+        int32_t il,
+        const ggml_tensor * w,
+        int32_t expert,
+        size_t slot_offset,
+        size_t expert_size);
 };
