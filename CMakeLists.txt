@@ -140,6 +140,7 @@ option(LLAMA_CONNECT         "llama: include the llama-connect tool (downloads a
 
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
+option(LLAMA_NEXUS_TEST_HOOKS "llama: compile nexus allocator test hooks (test-only, off in production)" OFF)
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)

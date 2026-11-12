@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-expert-source.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -331,6 +332,9 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    // expert_source se declara antes que moe_cache para que el cache (que solo
+    // lo referencia durante el compute) se destruya primero.
+    std::unique_ptr<llama_expert_source> expert_source;
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
@@ -440,6 +444,11 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // set when a decode/encode could not complete because an expert could not be
+    // prepared (Nexus I/O failure). The KV cache may contain entries for the
+    // partially processed batch, so the context refuses further work.
+    bool failed = false;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -1,3 +1,4 @@
+#include "llama-expert-source.h"
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -394,6 +395,10 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size      = params.moe_cache_size;
+    cparams.expert_stream       = params.expert_stream;
+    cparams.expert_ram_size     = params.expert_ram_size;
+    cparams.expert_stream_stats = params.expert_stream_stats;
+    cparams.expert_stream_verify = params.expert_stream_verify;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
     // resolved after flash attention, see resolve_fused_ops()
@@ -614,8 +619,31 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (cparams.expert_stream && !model.expert_meta.files.empty()) {
+            llama_expert_source::config es_cfg;
+            es_cfg.ram_warm_bytes = cparams.expert_ram_size > 0 ? cparams.expert_ram_size : 1024ull * 1024 * 1024;
+            es_cfg.stats          = cparams.expert_stream_stats;
+            es_cfg.verify         = cparams.expert_stream_verify;
+            auto es_result = llama_expert_source::create(model.expert_meta, es_cfg);
+            if (es_result.status == llama_expert_create_status::SUCCESS) {
+                expert_source = std::move(es_result.source);
+                LLAMA_LOG_INFO("%s: Nexus expert streaming source initialized (%.2f MiB L2 arena)\n",
+                    __func__, (double)es_cfg.ram_warm_bytes / (1024.0 * 1024.0));
+            } else if (es_result.status == llama_expert_create_status::NO_SUPPORTED_TENSORS) {
+                // No hay tensores MoE compatibles: Nexus se desactiva y el fallback
+                // mmap es la politica permitida por el diseno.
+                LLAMA_LOG_WARN("%s: no supported MoE expert tensors, Nexus disabled (mmap fallback)\n", __func__);
+            } else {
+                // INVALID_METADATA, OUT_OF_MEMORY o IO_ERROR: fallo real, no es un
+                // fallback permitido. Un experto corrompido no debe leerse via mmap.
+                LLAMA_LOG_ERROR("%s: Nexus expert source initialization failed (status %d), aborting context\n",
+                    __func__, (int) es_result.status);
+                throw std::runtime_error("Nexus expert source initialization failed");
+            }
+        }
+
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, expert_source.get());
         }
 
         sched_reserve();
@@ -641,6 +669,13 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // The MoE cache only references the expert source during graph compute, but
+    // both must be torn down while the backends are still alive: the source
+    // synchronizes its last transfers, and the backends are members declared
+    // later (destroyed earlier).
+    moe_cache.reset();
+    expert_source.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -952,7 +987,20 @@ void llama_context::synchronize() {
         return;
     }
 
+    // Nexus: la sincronizacion del scheduler tambien cubre las transferencias de
+    // expertos programadas por el MoE cache. Se cierra la compuerta antes y se
+    // confirman despues, de modo que una transferencia marcada como confirmada
+    // corresponda a un backend realmente sincronizado y ninguna hebra programe
+    // durante la espera.
+    if (expert_source) {
+        expert_source->begin_sync();
+    }
+
     ggml_backend_sched_synchronize(sched.get());
+
+    if (expert_source) {
+        expert_source->end_sync();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1885,6 +1933,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        if (status == GGML_STATUS_ABORTED && moe_cache && moe_cache->has_fatal_error()) {
+            // The split that needed the failed expert was not computed, but earlier
+            // splits may already have written to the KV cache. Do not let the
+            // context continue with a partially updated memory.
+            failed = true;
+            LLAMA_LOG_ERROR("%s: Nexus could not prepare an expert, the context is now unusable\n", __func__);
+        }
         ret = status;
         return nullptr;
     }
@@ -1895,6 +1950,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (failed) {
+        LLAMA_LOG_ERROR("%s: the context is unusable after a Nexus expert I/O failure, create a new context\n", __func__);
+        return -3; // GGML_STATUS_FAILED
+    }
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2143,6 +2203,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (failed) {
+        LLAMA_LOG_ERROR("%s: the context is unusable after a Nexus expert I/O failure, create a new context\n", __func__);
+        return -3; // GGML_STATUS_FAILED
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -3169,8 +3234,18 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
-        return true;
+    if (lctx->moe_cache) {
+        const auto st = lctx->moe_cache->copy(backend, src, dst, graph);
+        if (st == llama_moe_cache_copy_status::HANDLED) {
+            return true;
+        }
+        if (st == llama_moe_cache_copy_status::FATAL) {
+            // An expert slot could not be prepared. Report the input as handled so
+            // that the scheduler does not perform a conventional copy that would
+            // hide the failure, and request an abort before the split computes.
+            ggml_backend_sched_abort(lctx->sched.get());
+            return true;
+        }
     }
 
     auto & st = lctx->copy_experts;
@@ -3240,6 +3315,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
+            // Nexus no se engancha aqui: este camino no conoce la capa (il) y el
+            // streaming vive en el miss del MoE cache, que si la conoce.
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
         }
 
@@ -4455,6 +4532,10 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.expert_stream               =*/ false,
+        /*.expert_ram_size             =*/ 1024ull * 1024 * 1024,
+        /*.expert_stream_stats         =*/ false,
+        /*.expert_stream_verify        =*/ false,
         /*.moe_cache_cpu_share         =*/ 0.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

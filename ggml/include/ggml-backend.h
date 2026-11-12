@@ -390,6 +390,15 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Abort the graph compute that is currently running in this scheduler.
+    // A copy callback that cannot prepare a required input must return true (so
+    // that the scheduler does not perform the conventional copy) and call this
+    // function. The scheduler then stops before computing the affected split and
+    // ggml_backend_sched_graph_compute[_async]() returns GGML_STATUS_ABORTED.
+    // This is the only error channel of the copy callback: returning false means
+    // "not handled" and would silently fall back to the conventional copy.
+    GGML_API void                 ggml_backend_sched_abort(ggml_backend_sched_t sched);
+
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 

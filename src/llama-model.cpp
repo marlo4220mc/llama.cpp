@@ -2152,8 +2152,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     expert_meta.tensors.clear();
-    for (const auto & layer : layers) {
-        for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto & layer = layers[il];
+        struct expert_candidate {
+            ggml_tensor *           t;
+            llama_expert_tensor_role role;
+        };
+        const expert_candidate candidates[] = {
+            { layer.ffn_gate_up_exps, llama_expert_tensor_role::GATE_UP },
+            { layer.ffn_gate_exps,    llama_expert_tensor_role::GATE    },
+            { layer.ffn_up_exps,      llama_expert_tensor_role::UP      },
+            { layer.ffn_down_exps,    llama_expert_tensor_role::DOWN    },
+        };
+        for (const auto & cand : candidates) {
+            ggml_tensor * t = cand.t;
             if (!t) continue;
             auto it = ml.weights_map.find(ggml_get_name(t));
             if (it != ml.weights_map.end()) {
@@ -2163,14 +2175,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 t_meta.expert_stride = (uint64_t) t->nb[2];
                 t_meta.expert_bytes  = (uint64_t) t->nb[2];
                 t_meta.n_expert      = (int32_t) t->ne[2];
+                t_meta.layer_id      = (int32_t) il;
+                t_meta.role          = cand.role;
 
-                const bool is_moe        = (t->ne[2] > 1);
-                const bool is_row_dense  = (t->nb[1] == ggml_row_size(t->type, t->ne[0]));
-                const bool is_exp_dense  = (t->nb[2] == (uint64_t) t->ne[1] * t->nb[1]);
-                const uint64_t shard_sz  = (uint64_t) ml.files[it->second.idx]->size();
-                const bool fits_in_shard = (it->second.offs + (uint64_t) t->ne[2] * t->nb[2] <= shard_sz);
+                const bool is_moe       = (t->ne[2] > 1);
+                const bool is_row_dense = (t->nb[1] == ggml_row_size(t->type, t->ne[0]));
 
-                t_meta.is_supported = (is_moe && is_row_dense && is_exp_dense && fits_in_shard);
+                // Separar incompatibilidad geométrica de metadatos corruptos.
+                // Nunca calcular extent ni acceder a ml.files sin validar idx y
+                // las multiplicaciones/sumas que lo forman.
+                bool metadata_valid = it->second.idx < ml.files.size();
+                uint64_t extent_bytes = 0;
+                if (metadata_valid && t->ne[2] > 0 && t->nb[2] > 0 &&
+                    (uint64_t) t->ne[2] <= UINT64_MAX / (uint64_t) t->nb[2]) {
+                    extent_bytes = (uint64_t) t->ne[2] * (uint64_t) t->nb[2];
+                } else {
+                    metadata_valid = false;
+                }
+                if (metadata_valid && it->second.offs > UINT64_MAX - extent_bytes) {
+                    metadata_valid = false;
+                }
+                const uint64_t shard_sz = metadata_valid ? (uint64_t) ml.files[it->second.idx]->size() : 0;
+                const bool fits_in_shard = metadata_valid && it->second.offs + extent_bytes <= shard_sz;
+                if (!fits_in_shard && metadata_valid) {
+                    metadata_valid = false;
+                }
+
+                const bool dense_product_valid = t->ne[1] >= 0 && t->nb[1] > 0 &&
+                    (uint64_t) t->ne[1] <= UINT64_MAX / (uint64_t) t->nb[1];
+                if (!dense_product_valid) {
+                    metadata_valid = false;
+                }
+                const bool is_exp_dense = metadata_valid &&
+                    (t->nb[2] == (uint64_t) t->ne[1] * (uint64_t) t->nb[1]);
+                t_meta.validation = !metadata_valid ? llama_expert_tensor_validation::INVALID :
+                    ((is_moe && is_row_dense && is_exp_dense) ? llama_expert_tensor_validation::VALID :
+                                                                  llama_expert_tensor_validation::UNSUPPORTED);
+                t_meta.is_supported = t_meta.validation == llama_expert_tensor_validation::VALID;
                 expert_meta.tensors[t] = t_meta;
             }
         }

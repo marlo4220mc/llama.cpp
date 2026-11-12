@@ -60,6 +60,10 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    bool   expert_stream;
+    size_t expert_ram_size;
+    bool   expert_stream_stats;
+    bool   expert_stream_verify;
     float  moe_cache_cpu_share;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

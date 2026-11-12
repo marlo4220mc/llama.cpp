@@ -397,7 +397,11 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
-        size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        size_t moe_cache_size;
+        bool   expert_stream;        // enable NVMe-backed MoE expert streaming [EXPERIMENTAL]
+        size_t expert_ram_size;      // L2 warm RAM cache size in bytes [EXPERIMENTAL]
+        bool   expert_stream_stats;  // log streaming counters on shutdown [EXPERIMENTAL]
+        bool   expert_stream_verify; // byte-for-byte verification path [EXPERIMENTAL]      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
 
         // Abort callback

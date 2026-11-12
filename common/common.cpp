@@ -1772,6 +1772,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size      = params.moe_cache_size;
+    cparams.expert_stream       = params.expert_stream;
+    cparams.expert_ram_size     = params.expert_ram_size;
+    cparams.expert_stream_stats = params.expert_stream_stats;
+    cparams.expert_stream_verify = params.expert_stream_verify;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
     return cparams;

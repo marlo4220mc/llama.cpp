@@ -9,10 +9,14 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstring>
+#include <limits>
 #include <list>
+#include <map>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -20,6 +24,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// Hash para llama_expert_key
+size_t llama_expert_key_hash::operator()(const llama_expert_key & k) const {
+    size_t h = std::hash<int32_t>{}(k.layer_id);
+    h ^= std::hash<uintptr_t>{}(k.tensor_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int32_t>{}(k.expert_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+}
+
+// Lectura canónica robusta desde NVMe
 int64_t llama_expert_pread_full(int fd, void * buf, size_t count, uint64_t offset, uint64_t file_size) {
     if (count == 0) {
         return 0;
@@ -28,7 +41,6 @@ int64_t llama_expert_pread_full(int fd, void * buf, size_t count, uint64_t offse
         return -EINVAL;
     }
 
-    // Prevención estricta de desbordamiento aritmético
     if (offset > UINT64_MAX - count) {
         return -EOVERFLOW;
     }
@@ -45,12 +57,11 @@ int64_t llama_expert_pread_full(int fd, void * buf, size_t count, uint64_t offse
 
         if (n < 0) {
             if (errno == EINTR) {
-                continue; // Reintentar si fue interrumpido por señal
+                continue;
             }
             return -errno;
         }
         if (n == 0) {
-            // EOF prematuro antes de completar los bytes solicitados
             return -EIO;
         }
         total_read += (size_t) n;
@@ -59,115 +70,372 @@ int64_t llama_expert_pread_full(int fd, void * buf, size_t count, uint64_t offse
     return (int64_t) total_read;
 }
 
-void llama_expert_stats::log(const char * tag) const {
-    const uint64_t total = fills.load();
-    if (total == 0) {
-        return;
-    }
-    const uint64_t l2_h  = l2_hits.load();
-    const uint64_t l2_m  = l2_misses.load();
-    const uint64_t proc  = proc_bytes.load();
-    const uint64_t us    = io_us_total.load();
-    const uint64_t mx    = io_us_max.load();
-    const double avg_us  = l2_m > 0 ? double(us) / l2_m : 0.0;
-    const double l2_rate = total > 0 ? 100.0 * l2_h / total : 0.0;
-
-    LLAMA_LOG_INFO(
-        "nexus_expert_stream [%s]: fills=%zu | L2: hits=%zu (%.1f%%), misses=%zu | "
-        "NVMe read=%.2f MiB | latency: avg=%.1f us, max=%zu us | drops=%zu\n",
-        tag, (size_t) total, (size_t) l2_h, l2_rate, (size_t) l2_m,
-        proc / 1048576.0, avg_us, (size_t) mx, (size_t) drops.load());
-    if (verify_ok.load() + verify_fail.load() > 0) {
-        LLAMA_LOG_INFO("nexus_expert_stream [%s]: byte-verify ok=%zu, fail=%zu\n",
-            tag, (size_t) verify_ok.load(), (size_t) verify_fail.load());
+void llama_expert_stats::record(llama_expert_fill_status st) {
+    switch (st) {
+        case llama_expert_fill_status::LOADED:
+            // ya contabilizado como fill en el camino de exito
+            break;
+        case llama_expert_fill_status::FALLBACK_ALLOWED:
+            fallback_mmap.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case llama_expert_fill_status::NOT_SUPPORTED:
+            not_supported.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case llama_expert_fill_status::OUT_OF_MEMORY:
+            out_of_memory.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case llama_expert_fill_status::IO_ERROR:
+            rejected_io.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case llama_expert_fill_status::INVALID_EXTENT:
+            rejected_invalid.fetch_add(1, std::memory_order_relaxed);
+            break;
     }
 }
 
+void llama_expert_stats::log(const char * tag) const {
+    const uint64_t attempts  = fill_attempts.load();
+    const uint64_t total     = fills.load();
+    const uint64_t reads     = completed_reads.load();
+    const uint64_t programmed = uploads_programmed.load();
+    const uint64_t confirmed = uploads_confirmed.load();
+    const uint64_t l2_h      = l2_hits.load();
+    const uint64_t l2_m      = l2_misses.load();
+    const uint64_t bytes     = proc_bytes.load();
+    const uint64_t uploaded  = upload_bytes.load();
+    const uint64_t us        = io_us_total.load();
+    const uint64_t max_u     = io_us_max.load();
+    const uint64_t fallback  = fallback_mmap.load();
+    const uint64_t not_sup   = not_supported.load();
+    const uint64_t oom       = out_of_memory.load();
+    const uint64_t rej_io    = rejected_io.load();
+    const uint64_t rej_inv   = rejected_invalid.load();
+
+    if (attempts == 0 && total == 0 && l2_h == 0 && l2_m == 0 && fallback == 0 && not_sup == 0 &&
+        oom == 0 && rej_io == 0 && rej_inv == 0) {
+        return;
+    }
+
+    // El hit rate de L2 se calcula sobre las consultas a la arena (hits + misses),
+    // no sobre `fills`: los fills rechazados o en fallback no consultaron L2.
+    // Los aciertos de L1 (banco del dispositivo) los reporta llama_moe_cache.
+    const uint64_t lookups  = l2_h + l2_m;
+    const double   hit_rate = lookups > 0 ? 100.0 * (double) l2_h / (double) lookups : 0.0;
+    const double   avg_us   = reads > 0 ? (double) us / (double) reads : 0.0;
+    const double   mb       = (double) bytes / (1024.0 * 1024.0);
+    const double   up_mb    = (double) uploaded / (1024.0 * 1024.0);
+    const double   thr      = us > 0 ? mb / ((double) us / 1000000.0) : 0.0;
+
+    LLAMA_LOG_INFO(
+        "nexus-expert-stream [%s]: attempts=%lu fills=%lu reads=%lu uploads=%lu confirmed=%lu | L2: hit=%lu miss=%lu (hit_rate=%.1f%%)\n",
+        tag, (unsigned long) attempts, (unsigned long) total, (unsigned long) reads,
+        (unsigned long) programmed, (unsigned long) confirmed,
+        (unsigned long) l2_h, (unsigned long) l2_m, hit_rate);
+    LLAMA_LOG_INFO(
+        "nexus-expert-stream [%s]: NVMe: %.2f MiB in %lu completed reads, avg=%.1f us, max=%lu us (%.2f MiB/s) | uploaded: %.2f MiB\n",
+        tag, mb, (unsigned long) reads, avg_us, (unsigned long) max_u, thr, up_mb);
+    LLAMA_LOG_INFO(
+        "nexus-expert-stream [%s]: fallback mmap=%lu not_supported=%lu oom=%lu rejected_io=%lu rejected_invalid=%lu | drops=%lu verify ok=%lu fail=%lu\n",
+        tag, (unsigned long) fallback, (unsigned long) not_sup, (unsigned long) oom,
+        (unsigned long) rej_io, (unsigned long) rej_inv,
+        (unsigned long) drops.load(), (unsigned long) verify_ok.load(), (unsigned long) verify_fail.load());
+}
+
 void llama_expert_stats::reset() {
+    fill_attempts.store(0);
     fills.store(0);
+    completed_reads.store(0);
+    uploads_programmed.store(0);
+    uploads_confirmed.store(0);
     l2_hits.store(0);
     l2_misses.store(0);
     proc_bytes.store(0);
+    upload_bytes.store(0);
     io_us_total.store(0);
     io_us_max.store(0);
+    fallback_mmap.store(0);
+    not_supported.store(0);
+    out_of_memory.store(0);
+    rejected_io.store(0);
+    rejected_invalid.store(0);
     drops.store(0);
     verify_ok.store(0);
     verify_fail.store(0);
 }
 
+// ---------------------------------------------------------------------------
+// Allocator First-Fit & Cuarentena
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool safe_align_up(size_t req_bytes, size_t A, size_t & out_aligned) noexcept {
+    if (A == 0 || (A & (A - 1)) != 0) {
+        return false;
+    }
+    if (req_bytes > SIZE_MAX - (A - 1)) {
+        return false;
+    }
+    size_t res = (req_bytes + (A - 1)) & ~(A - 1);
+    if (res < req_bytes) {
+        return false;
+    }
+    out_aligned = res;
+    return true;
+}
+
+enum class fail_reason {
+    none,
+    epoch_overflow,
+    epoch_regression,
+    sync_failed,
+    teardown_sync_failed,
+    inflight_without_block,
+    inflight_underflow,
+    residual_inflight,
+    lifetime_violation,
+    rollback_failed
+};
+
+// Resultado del allocator para distinguir exito, capacidad insuficiente y fallo
+// interno (D-1.6.4, hallazgo 2). Un fallo interno activa fatal y retira la arena:
+// el llamante NO debe evictar ni reintentar.
+enum class alloc_result {
+    OK,
+    NO_CAPACITY,
+    INTERNAL_FAILURE,
+};
+
+// NOTA DE GARANTIA (D-1.6.2, objetivo D): std::map::extract(const_iterator) y
+// std::map::insert(node_type&&) NO estan marcados noexcept por libstdc++ (los
+// static_assert de esta garantia fallan), por lo que no se afirma "noexcept".
+// La no-lanzabilidad en la practica se apoya en dos hechos concretos para
+// std::map<size_t,size_t>:
+//   1. el comparador std::less<size_t>::operator() es noexcept;
+//   2. extract no asigna y insert(node_type&&) reutiliza el nodo ya asignado,
+//      sin reservar memoria nueva.
+// Aun asi, restore_alloc() y las rutas de rollback verifican el retorno y, ante
+// un fallo teorico, aplican la politica de fallo seguro (quarantena + fatal).
+
+struct quarantine_node {
+    ggml_backend_buffer_t arena_buf   = nullptr;
+    void *                arena_base  = nullptr;
+    size_t                arena_bytes = 0;
+    bool                  owns_arena  = false;
+    ggml_backend_t        backend     = nullptr;
+    fail_reason           reason      = fail_reason::none;
+    bool                  fail_stop   = false;
+    quarantine_node *     next        = nullptr;
+};
+
+static_assert(std::is_nothrow_default_constructible<quarantine_node>::value,
+    "quarantine_node must be nothrow default constructible");
+
+struct process_arena_quarantine {
+    static_assert(
+        std::atomic<quarantine_node *>::is_always_lock_free,
+        "nexus D-0 requires lock-free pointer atomics for the quarantine list");
+
+    std::atomic<quarantine_node *> head{nullptr};
+
+    void enroll(quarantine_node * node) noexcept {
+        if (!node) return;
+        quarantine_node * current = head.load(std::memory_order_relaxed);
+        do {
+            node->next = current;
+        } while (!head.compare_exchange_weak(
+            current, node,
+            std::memory_order_release,
+            std::memory_order_relaxed));
+    }
+};
+
+static process_arena_quarantine g_arena_quarantine;
+
+#if defined(GGML_NEXUS_TEST_HOOKS)
+// Gancho de inyeccion de fallos TEST-ONLY, compilado SOLO cuando la opcion
+// LLAMA_NEXUS_TEST_HOOKS esta activa. En produccion no existe ni esta rama ni
+// los atomic globales, por lo que el allocator no tiene lecturas extra. Un valor
+// >= 0 hace fallar la fase asignadora numero `phases`; -2 = fallar siempre
+// hasta desarmar; -1 = desarmado.
+static std::atomic<long long> g_nexus_test_alloc_fail{-1};
+
+static bool nexus_test_fail_alloc() noexcept {
+    const long long v = g_nexus_test_alloc_fail.load(std::memory_order_relaxed);
+    if (v == -2) {
+        // modo "fallar siempre hasta desarmar": solo lo usan las pruebas
+        return true;
+    }
+    if (v < 0) {
+        return false;
+    }
+    return g_nexus_test_alloc_fail.fetch_sub(1, std::memory_order_relaxed) == 0;
+}
+
+// Gancho independiente para restaurar el fallo de rollback (restore_alloc).
+static std::atomic<long long> g_nexus_test_restore_fail{-1};
+
+static bool nexus_test_fail_restore() noexcept {
+    const long long v = g_nexus_test_restore_fail.load(std::memory_order_relaxed);
+    if (v == -2) {
+        return true;
+    }
+    if (v < 0) {
+        return false;
+    }
+    return g_nexus_test_restore_fail.fetch_sub(1, std::memory_order_relaxed) == 0;
+}
+
+// Gancho independiente para fallar la reinsercion del remainder en alloc_block
+// (hallazgo 1). Mantiene separadas las fases de publicacion de las del allocator.
+static std::atomic<long long> g_nexus_test_allocblock_fail{-1};
+
+static bool nexus_test_fail_allocblock() noexcept {
+    const long long v = g_nexus_test_allocblock_fail.load(std::memory_order_relaxed);
+    if (v == -2) {
+        return true;
+    }
+    if (v < 0) {
+        return false;
+    }
+    return g_nexus_test_allocblock_fail.fetch_sub(1, std::memory_order_relaxed) == 0;
+}
+
+// Pausa determinista del cargador (test-only): cuando esta activa, el hilo que
+// carga un experto se detiene en la ventana LOADING antes del pread, de modo
+// que la prueba puede colocar esperadores en cv_loading de forma determinista.
+static std::mutex g_test_pause_mutex;
+static std::condition_variable g_test_pause_cv;
+static std::atomic<bool> g_test_pause_loader{false};
+static std::atomic<bool> g_test_loader_paused{false};
+
+static void nexus_test_pause_loader() {
+    if (g_test_pause_loader.load(std::memory_order_acquire)) {
+        g_test_loader_paused.store(true, std::memory_order_release);
+        std::unique_lock<std::mutex> lk(g_test_pause_mutex);
+        g_test_pause_cv.wait(lk, []{
+            return !g_test_pause_loader.load(std::memory_order_acquire);
+        });
+    }
+}
+#endif // GGML_NEXUS_TEST_HOOKS
+
+} // namespace
+
+// Metadatos por bloque vivo
+struct nexus_l2_block {
+    size_t                offset          = 0;
+    size_t                size            = 0;
+    size_t                slack           = 0;
+    size_t                req_bytes       = 0;
+    llama_expert_content  content         = llama_expert_content::EMPTY;
+    int32_t               pin_layers      = 0;
+    int32_t               inflight        = 0;
+    bool                  needs_proof     = false;
+    uint64_t              lru_tick        = 0;
+    uint64_t              last_fill_epoch = 0;
+    std::list<llama_expert_key>::iterator lru_it;
+};
+
 struct llama_expert_source::impl {
+    struct fill_active_guard;
+
     struct shard_file {
         std::string path;
         int         fd   = -1;
         uint64_t    size = 0;
     };
 
-    struct l2_key {
-        int32_t il;
-        const ggml_tensor * w;
-        int32_t expert;
-
-        bool operator==(const l2_key & o) const {
-            return il == o.il && w == o.w && expert == o.expert;
-        }
-    };
-
-    struct l2_key_hash {
-        size_t operator()(const l2_key & k) const {
-            size_t h = std::hash<int32_t>{}(k.il);
-            h ^= std::hash<const void *>{}(k.w) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            h ^= std::hash<int32_t>{}(k.expert) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            return h;
-        }
-    };
-
-    struct l2_entry {
-        size_t   arena_type = 0; // 0 = gate_up/large, 1 = down/small
-        size_t   slot_idx   = 0;
-        bool     pinned     = false;
-        int32_t  layer_id   = -1;
-        std::list<l2_key>::iterator lru_it;
-    };
-
-    struct stage_slot {
-        void *   ptr  = nullptr;
-        size_t   size = 0;
-        bool     busy = false;
-        int32_t  layer_id = -1;
-        ggml_backend_buffer_t buf = nullptr;
-    };
-
     config cfg;
     std::vector<shard_file> shards;
     std::unordered_map<const ggml_tensor *, llama_expert_tensor_meta> extents;
 
-    // Dimensiones de expertos detectadas
-    size_t size_gate_up = 0;
-    size_t size_down    = 0;
     size_t max_expert_size = 0;
+    // bytes de un par de expertos de una capa (gate_up, o gate+up, mas down);
+    // 0 = capacidad desconocida porque los roles/capas no estan identificados
+    size_t pair_bytes      = 0;
 
-    // L2 Warm RAM Cache (partición exacta)
-    size_t max_l2_pairs = 0; // 320 pares completos para 1024 MiB en Gemma 4
-    std::vector<uint8_t> arena_gate_up;
-    std::vector<uint8_t> arena_down;
-    std::vector<bool>    gate_up_free;
-    std::vector<bool>    down_free;
+    // Memoria física de la arena L2 única
+    ggml_backend_buffer_t arena_buf   = nullptr;
+    void *                arena_base  = nullptr;
+    size_t                arena_bytes = 0;
+    size_t                alignment   = 0;
+    bool                  owns_arena  = false;
+    // la arena se retiro del uso sin liberarla (cuarentena del proceso): puede
+    // haber una transferencia del dispositivo que aun la este leyendo
+    std::atomic<bool>     arena_quarantined{false};
+    llama_expert_mem_kind mem_kind    = llama_expert_mem_kind::PAGEABLE_HOST;
 
-    std::list<l2_key> l2_lru_list;
-    std::unordered_map<l2_key, l2_entry, l2_key_hash> l2_index;
-    std::mutex l2_mutex;
+    // Allocator First-Fit
+    std::map<size_t, size_t> free_holes; // offset -> size
+    size_t aligned_bytes = 0;
+    size_t slack_bytes   = 0;
+    size_t free_bytes    = 0;
 
-    // Staging Ring
-    std::vector<stage_slot> ring_slots;
-    std::mutex ring_mutex;
-    std::condition_variable ring_cv;
-    ggml_backend_t last_backend = nullptr;
+    // Índice de bloques y LRU
+    std::unordered_map<llama_expert_key, nexus_l2_block, llama_expert_key_hash> l2_index;
+    std::list<llama_expert_key> l2_lru_list;
+    uint64_t current_lru_tick = 0;
 
+    // Concurrencia y Barrera
+    mutable std::mutex l2_mutex;
+    std::condition_variable cv_idle;
+    std::condition_variable cv_gate;
+    std::condition_variable cv_quiescent;
+    std::condition_variable cv_loading;
+
+    bool     gate_closed       = false;
+    uint64_t gate_epoch        = 0;
+    int      programming_fills = 0;
+    int      active_fills      = 0;
+    bool     barrier_active    = false;
+    bool     teardown          = false;
+    bool     aborted           = false;
+    bool     frozen            = false;
+
+    // Confirmacion en dos fases (begin_sync/end_sync)
+    bool     sync_pending        = false;
+    uint64_t sync_epoch_snapshot = 0;
+
+    // Tracking de epochs y sincronización
+    uint64_t fill_epoch = 0;
+    uint64_t last_confirmed_epoch = 0;
+    struct inflight_entry {
+        llama_expert_key key;
+        uint64_t epoch;
+    };
+    std::list<inflight_entry> l2_inflight;
+
+    // Backend
+    ggml_backend_t bound_backend = nullptr;
+    enum class sync_mode { UNKNOWN, HOST_ONLY, CPU_SYNC, CALLBACK_SYNC };
+    sync_mode effective_sync_mode = sync_mode::UNKNOWN;
+
+    // Fail-Stop & Cuarentena
+    std::atomic_flag fail_stop_claimed = ATOMIC_FLAG_INIT;
+    std::atomic<bool> fatal{false};
+    std::unique_ptr<quarantine_node> preallocated_quarantine;
+
+    // Estadísticas
     llama_expert_stats stats;
+    mutable llama_expert_arena_stats arena_stats;
+
+    // Contadores de eventos
+    uint64_t evictions         = 0;
+    uint64_t evict_bytes       = 0;
+    uint64_t evict_slack_bytes = 0;
+    uint64_t sync_calls        = 0;
+    uint64_t sync_failures     = 0;
+    uint64_t alloc_fail        = 0;
+    uint64_t oom_rejects       = 0;
+
+    impl() = default;
 
     ~impl() {
-        synchronize_backend();
-        stats.log("shutdown");
+        if (arena_base != nullptr) {
+            drain_for_teardown();
+            stats.log("shutdown");
+        }
 
         for (auto & s : shards) {
             if (s.fd >= 0) {
@@ -176,59 +444,884 @@ struct llama_expert_source::impl {
             }
         }
 
-        for (auto & slot : ring_slots) {
-            if (slot.buf) {
-                ggml_backend_buffer_free(slot.buf);
-                slot.buf = nullptr;
-                slot.ptr = nullptr;
-            } else if (slot.ptr) {
-                free(slot.ptr);
-                slot.ptr = nullptr;
-            }
+        if (arena_buf) {
+            ggml_backend_buffer_free(arena_buf);
+            arena_buf = nullptr;
+            arena_base = nullptr;
+        } else if (owns_arena && arena_base) {
+            free(arena_base);
+            arena_base = nullptr;
         }
     }
 
-    void synchronize_backend() {
-        if (last_backend) {
-            ggml_backend_synchronize(last_backend);
+    [[noreturn]] void enter_fail_stop(fail_reason reason) noexcept {
+        if (fail_stop_claimed.test_and_set(std::memory_order_acq_rel)) {
+            for (;;) {
+                std::this_thread::yield();
+            }
         }
+
+        fatal.store(true, std::memory_order_release);
+
+        if (preallocated_quarantine) {
+            quarantine_node * q = preallocated_quarantine.release();
+            q->arena_buf   = arena_buf;
+            q->arena_base  = arena_base;
+            q->arena_bytes = arena_bytes;
+            q->owns_arena  = owns_arena;
+            q->backend     = bound_backend;
+            q->reason      = reason;
+            q->fail_stop   = true;
+
+            g_arena_quarantine.enroll(q);
+        }
+
+        std::_Exit(EXIT_FAILURE);
     }
 
-    void * acquire_stage(size_t required_size, int32_t layer_id) {
-        std::unique_lock<std::mutex> lock(ring_mutex);
-        for (;;) {
-            for (auto & slot : ring_slots) {
-                if (!slot.busy && slot.size >= required_size) {
-                    slot.busy = true;
-                    slot.layer_id = layer_id;
-                    return slot.ptr;
+    // Retira la arena del uso sin liberarla. Se usa cuando no se puede demostrar
+    // que el dispositivo ya no la esta leyendo (transferencia pendiente cuyo
+    // resultado de sincronizacion no se puede observar, o barrera activa al
+    // iniciar el teardown). La memoria se filtra a proposito: es preferible
+    // perderla a devolverla al heap mientras Vulkan/CPU todavia la usa.
+    void quarantine_arena(fail_reason reason) noexcept {
+        arena_quarantined.store(true, std::memory_order_release);
+
+        if (preallocated_quarantine) {
+            quarantine_node * q = preallocated_quarantine.release();
+            q->arena_buf   = arena_buf;
+            q->arena_base  = arena_base;
+            q->arena_bytes = arena_bytes;
+            q->owns_arena  = owns_arena;
+            q->backend     = bound_backend;
+            q->reason      = reason;
+            q->fail_stop   = false;
+
+            g_arena_quarantine.enroll(q);
+        }
+
+        // pase lo que pase, el destructor no debe liberar esta memoria
+        arena_buf  = nullptr;
+        arena_base = nullptr;
+        owns_arena = false;
+    }
+
+
+    void init_backend_memory(ggml_backend_t backend) {
+        if (!backend || arena_buf != nullptr) {
+            return;
+        }
+        // Solo se puede sustituir la reserva mientras no haya bloques vivos: los
+        // punteros de la arena ya entregados dejarian de ser validos.
+        if (!l2_index.empty()) {
+            LLAMA_LOG_WARN("nexus-expert-stream: arena already in use, keeping PAGEABLE_HOST\n");
+            return;
+        }
+#if defined(GGML_USE_VULKAN)
+        if (ggml_backend_is_vk(backend)) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            if (dev) {
+                ggml_backend_buffer_type_t expected_buft = ggml_backend_dev_host_buffer_type(dev);
+                if (expected_buft != nullptr && expected_buft == ggml_backend_vk_host_buffer_type()) {
+                    // Bloqueante C: la alineacion activa NO se modifica hasta que
+                    // la reserva nueva este confirmada y comprometida. Cualquier
+                    // fallo conserva la arena posix original, su alineacion y su
+                    // clasificacion de memoria honesta.
+                    ggml_backend_buffer_t vk_buf = ggml_backend_buft_alloc_buffer(expected_buft, arena_bytes);
+                    if (vk_buf != nullptr) {
+                        // Bloqueante D: durante esta ventana existen dos reservas
+                        // completas (posix + Vulkan). Es el pico transitorio de la
+                        // sustitucion transaccional: no se libera la arena activa
+                        // antes de tener una nueva validada. Pico = 2 * arena_bytes.
+                        ggml_backend_buffer_type_t effective_buft = ggml_backend_buffer_get_type(vk_buf);
+                        const size_t effective_alignment = ggml_backend_buffer_get_alignment(vk_buf);
+                        void * new_base = ggml_backend_buffer_get_base(vk_buf);
+                        if (effective_alignment == 0 ||
+                            (effective_alignment & (effective_alignment - 1)) != 0 ||
+                            effective_alignment % sizeof(void *) != 0 ||
+                            new_base == nullptr) {
+                            LLAMA_LOG_ERROR("nexus-expert-stream: invalid allocated Vulkan buffer (alignment %zu, base %p), "
+                                            "keeping the pageable arena\n", effective_alignment, (void *) new_base);
+                            ggml_backend_buffer_free(vk_buf);
+                            return;
+                        }
+                        if (effective_buft == expected_buft) {
+                            // Escenario 1: PINNED_VK exitoso. Se adopta la alineacion
+                            // del buffer nuevo y se libera la reserva anterior.
+                            if (owns_arena && arena_base) {
+                                free(arena_base);
+                            }
+                            arena_buf   = vk_buf;
+                            arena_base  = new_base;
+                            owns_arena  = false;
+                            alignment   = effective_alignment;
+                            mem_kind    = llama_expert_mem_kind::PINNED_VK;
+                            LLAMA_LOG_INFO("nexus-expert-stream: upgraded to PINNED_VK host buffer (%zu bytes, alignment %zu)\n",
+                                    arena_bytes, alignment);
+                            return;
+                        }
+                        if (effective_buft == ggml_backend_cpu_buffer_type()) {
+                            // Escenario 2: PAGEABLE_HOST_FALLBACK devuelto por Vulkan
+                            if (owns_arena && arena_base) {
+                                free(arena_base);
+                            }
+                            arena_buf   = vk_buf;
+                            arena_base  = new_base;
+                            owns_arena  = false;
+                            alignment   = effective_alignment;
+                            mem_kind    = llama_expert_mem_kind::PAGEABLE_HOST_FALLBACK;
+                            LLAMA_LOG_WARN("nexus-expert-stream: Vulkan returned CPU fallback buffer (PAGEABLE_HOST_FALLBACK, alignment %zu)\n",
+                                    alignment);
+                            return;
+                        }
+                        // Buffer devuelto no soportado / desconocido -> rechazar y
+                        // conservar la reserva y alineacion originales.
+                        LLAMA_LOG_ERROR("nexus-expert-stream: unsupported buffer type returned by Vulkan, "
+                                        "keeping the pageable arena\n");
+                        ggml_backend_buffer_free(vk_buf);
+                    } else {
+                        LLAMA_LOG_ERROR("nexus-expert-stream: Vulkan host buffer allocation failed, "
+                                        "keeping the pageable arena\n");
+                    }
                 }
             }
-            stats.drops++;
-            // Si el anillo está saturado, forzamos sincronización del backend para reciclar
-            if (last_backend) {
-                lock.unlock();
-                ggml_backend_synchronize(last_backend);
-                lock.lock();
-                for (auto & slot : ring_slots) {
-                    slot.busy = false;
+        }
+#endif
+        // Sin backend Vulkan o sin host buft disponible: se mantiene la reserva
+        // posix_memalign (PAGEABLE_HOST). No se afirma que sea memoria pinned.
+        LLAMA_LOG_INFO("nexus-expert-stream: keeping PAGEABLE_HOST arena (no pinned host buffer available)\n");
+    }
+
+    // Allocator First-Fit. Las mutaciones de free_holes usan extract()/insert()
+    // con node_type, que no asignan: un bad_alloc nunca deja el allocator a
+    // medio modificar.
+    //
+    // Si el hueco se consume por completo (rem < alignment, incluido rem == 0),
+    // el nodo extraido conserva el hueco original y se entrega via
+    // out_restore_node: el llamante lo sostiene durante la publicacion del
+    // bloque para que el rollback pueda reinsertarlo sin asignar. Si deja un
+    // remainder (rem >= alignment), el rollback se fusiona con el.
+    //
+    // Devuelve alloc_result::INTERNAL_FAILURE (con fatal + cuarentena) si un
+    // fallo interno impide continuar; el llamante NO debe evictar ni reintentar.
+    alloc_result alloc_block(size_t req_bytes, size_t & out_offset, size_t & out_size, size_t & out_slack,
+                             std::map<size_t, size_t>::node_type * out_restore_node = nullptr) {
+        size_t req = 0;
+        if (!safe_align_up(req_bytes, alignment, req)) {
+            return alloc_result::NO_CAPACITY;
+        }
+
+        for (auto it = free_holes.begin(); it != free_holes.end(); ++it) {
+            const size_t h_offset = it->first;
+            const size_t h_size   = it->second;
+
+            if (h_size >= req) {
+                size_t rem = h_size - req;
+                out_offset = h_offset;
+                out_size   = req;
+
+                auto node = free_holes.extract(it);
+                if (rem == 0) {
+                    out_slack = 0;
+                } else if (rem < alignment) {
+                    out_slack = rem;
+                } else {
+                    out_slack = 0;
+                    node.key()    = h_offset + req;
+                    node.mapped() = rem;
+                    // En la practica insert(node_type&&) no lanza (comparador
+                    // noexcept, sin asignacion nueva). El hook TEST-ONLY se lanza
+                    // DENTRO del try para que el catch del allocator maneje el
+                    // fallo real. Si ocurriera, se RESTAURA el hueco ORIGINAL
+                    // {h_offset: h_size} (no el remainder): los contadores no se
+                    // han tocado aun, y free_holes debe volver a representar
+                    // exactamente el hueco completo.
+                    try {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+                        // inyeccion TEST-ONLY: fallo al reinsertar el remainder.
+                        if (nexus_test_fail_allocblock()) {
+                            throw std::bad_alloc();
+                        }
+#endif
+                        free_holes.insert(std::move(node));
+                    } catch (...) {
+                        bool restored = false;
+                        if (node) {
+                            node.key()    = h_offset;
+                            node.mapped() = h_size;
+                            try {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+                                if (nexus_test_fail_allocblock()) {
+                                    throw std::bad_alloc();
+                                }
+#endif
+                                free_holes.insert(std::move(node));
+                                restored = true;
+                            } catch (...) {
+                                // cae al emplace alternativo
+                            }
+                        }
+                        if (!restored) {
+                            try {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+                                if (nexus_test_fail_allocblock()) {
+                                    throw std::bad_alloc();
+                                }
+#endif
+                                free_holes.emplace(h_offset, h_size);
+                                restored = true;
+                            } catch (...) {
+                                // fallo triple terminal: la contabilidad quedaria
+                                // dudosa; se retira la arena y se marca fatal.
+                                LLAMA_LOG_ERROR("nexus-expert-stream: allocator double-failure, "
+                                                "quarantining the arena\n");
+                                enter_terminal(fail_reason::rollback_failed);
+                                return alloc_result::INTERNAL_FAILURE;
+                            }
+                        }
+                        return alloc_result::NO_CAPACITY;
+                    }
                 }
-                ring_cv.notify_all();
-            } else {
-                ring_cv.wait(lock);
+
+                // rem < alignment: el hueco se consumio por completo y el nodo
+                // extraido sigue con los valores originales. Se entrega como
+                // respaldo de rollback si el llamante lo pide.
+                if ((rem == 0 || rem < alignment) && out_restore_node != nullptr) {
+                    *out_restore_node = std::move(node);
+                }
+
+                aligned_bytes += out_size;
+                slack_bytes   += out_slack;
+                free_bytes    -= (out_size + out_slack);
+                return alloc_result::OK;
             }
+        }
+        return alloc_result::NO_CAPACITY;
+    }
+
+    // Rollback de una region asignada por alloc_block que no llego a publicarse.
+    // Si alloc_block dejo un remainder (rem >= alignment), se llama free_block
+    // que se fusiona con el. Si consumio el hueco completo, se reinserta el nodo
+    // retenido. En la practica ninguna ruta lanza (comparador std::less<size_t>
+    // noexcept y sin asignacion nueva); de ocurrir, se devuelve false y el
+    // llamante aplica la politica terminal (fail_rollback). No se afirma
+    // "noexcept" de firma: libstdc++ no marca estas primitivas como noexcept.
+    bool restore_alloc(size_t offset, size_t size, size_t slack,
+                       std::map<size_t, size_t>::node_type node) {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+        // inyeccion TEST-ONLY: provoca el fallo del rollback en el punto real.
+        if (nexus_test_fail_restore()) {
+            return false;
+        }
+#endif
+        if (node) {
+            try {
+                free_holes.insert(std::move(node));
+            } catch (...) {
+                return false;
+            }
+            aligned_bytes -= size;
+            slack_bytes   -= slack;
+            free_bytes    += (size + slack);
+            return true;
+        }
+        return free_block(offset, size, slack); // caso merge
+    }
+
+    // Politica TERMINAL ante un rollback imposible o un fallo interno: la arena
+    // se retira (no se libera ni se reutiliza), la fuente queda fatal y se
+    // despierta a TODOS los esperadores (cv_loading, cv_gate, cv_quiescent,
+    // cv_idle) cuyas condiciones de espera dependen de `fatal` o de poder
+    // terminar. Debe llamarse con l2_mutex tomado. No invoca std::_Exit().
+    void enter_terminal(fail_reason reason) {
+        fatal.store(true, std::memory_order_release);
+        quarantine_arena(reason);
+        cv_loading.notify_all();
+        cv_gate.notify_all();
+        cv_quiescent.notify_all();
+        cv_idle.notify_all();
+    }
+
+    // Politica terminal ante un rollback imposible, vista desde fill_expert_impl:
+    // propaga IO_ERROR (no OUT_OF_MEMORY) para que el MoE cache no lo trate como
+    // OOM recuperable (solo IO_ERROR/INVALID_EXTENT producen copy FATAL).
+    llama_expert_fill_status fail_rollback(const char * why) noexcept {
+        LLAMA_LOG_ERROR("nexus-expert-stream: rollback failed (%s), quarantining the arena\n", why);
+        enter_terminal(fail_reason::rollback_failed);
+        return llama_expert_fill_status::IO_ERROR;
+    }
+
+    // Libera [offset, size+slack) de vuelta a free_holes. Devuelve true solo si
+    // el hueco quedo reinsertado y los contadores actualizados. NUNCA deja el
+    // allocator a medio modificar:
+    //   - caso con vecinos: los nodos se extraen y el hueco fusionado se
+    //     reinserta reutilizando el nodo extraido (sin asignacion nueva);
+    //   - caso de hueco nuevo: la unica operacion asignadora se intenta antes de
+    //     tocar nada; si falla, no se modifica ni free_holes ni los contadores.
+    // No se afirma noexcept de firma (libstdc++ no lo marca); la no-lanzabilidad
+    // practica se apoya en el comparador noexcept y en la ausencia de asignacion.
+    bool free_block(size_t offset, size_t size, size_t slack) {
+        // Proteccion contra overflow: size y slack provienen de bloques vivos,
+        // pero se audita explicitamente antes de sumar.
+        if (size > SIZE_MAX - slack) {
+            return false;
+        }
+        size_t total = size + slack;
+
+        auto next = free_holes.lower_bound(offset);
+        auto prev = (next != free_holes.begin()) ? std::prev(next) : free_holes.end();
+
+        const bool merges_prev = prev != free_holes.end() && prev->first + prev->second == offset;
+        const bool merges_next = next != free_holes.end() && offset + total == next->first;
+
+        if (merges_prev) {
+            // std::map<size_t,size_t>: el comparador std::less<size_t> no puede
+            // lanzar y extract()/insert(node_type&&) no asignan (reutilizan el
+            // nodo). En la practica estas rutas no lanzan; la firma no esta
+            // marcada noexcept por libstdc++ (ver nota de garantia arriba).
+            auto node = free_holes.extract(prev);
+            size_t new_offset = node.key();
+            size_t new_size   = total + node.mapped();
+            if (merges_next) {
+                // `next` puede haberse invalidado al extraer `prev`; rebuscarlo.
+                auto it2 = free_holes.lower_bound(offset);
+                if (it2 != free_holes.end() && offset + total == it2->first) {
+                    auto node2 = free_holes.extract(it2);
+                    new_size += node2.mapped();
+                }
+            }
+            node.key()    = new_offset;
+            node.mapped() = new_size;
+            free_holes.insert(std::move(node)); // sin asignacion nueva
+        } else if (merges_next) {
+            auto node = free_holes.extract(next);
+            node.key()    = offset;
+            node.mapped() = total + node.mapped();
+            free_holes.insert(std::move(node)); // sin asignacion nueva
+        } else {
+            // Hueco completamente nuevo: unica operacion asignadora. Se intenta
+            // antes de tocar contadores; un fallo no modifica nada.
+            // Defensivo (imposible en operacion normal): rechazar doble
+            // liberacion o solapamiento con huecos existentes.
+            auto hole_check = free_holes.lower_bound(offset);
+            if (hole_check != free_holes.end() && hole_check->first == offset) {
+                return false; // doble liberacion exacta de la misma region
+            }
+            auto prev_check = (hole_check != free_holes.begin()) ? std::prev(hole_check) : free_holes.end();
+            if (prev_check != free_holes.end() && prev_check->first + prev_check->second > offset) {
+                return false; // solapamiento con el hueco anterior
+            }
+            if (hole_check != free_holes.end() && offset + total > hole_check->first) {
+                return false; // solapamiento con el hueco siguiente
+            }
+            try {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+                // inyeccion TEST-ONLY: el bad_alloc real se lanza DENTRO del try,
+                // de modo que el catch de produccion se ejecuta de verdad. NOTA:
+                // esto ejercita el manejador de excepciones, no demuestra que
+                // std::map::emplace en si lance bad_alloc (para eso haria falta
+                // un allocator de prueba en el tipo del mapa).
+                if (nexus_test_fail_alloc()) {
+                    throw std::bad_alloc();
+                }
+#endif
+                free_holes.emplace(offset, total);
+            } catch (...) {
+                return false;
+            }
+        }
+
+        aligned_bytes -= size;
+        slack_bytes   -= slack;
+        free_bytes    += total;
+        return true;
+    }
+
+    bool evict_lru_victim() {
+        for (auto it = l2_lru_list.rbegin(); it != l2_lru_list.rend(); ++it) {
+            auto idx_it = l2_index.find(*it);
+            if (idx_it == l2_index.end()) continue;
+
+            nexus_l2_block & blk = idx_it->second;
+            if (blk.content == llama_expert_content::RESIDENT &&
+                blk.pin_layers == 0 &&
+                blk.inflight == 0 &&
+                !blk.needs_proof &&
+                last_confirmed_epoch >= blk.last_fill_epoch) {
+
+                // Solo se despublica el bloque si la liberacion confirmo exito.
+                // Si falla, el bloque, la lista LRU, los indices y los contadores
+                // quedan integros (sin perdida silenciosa de capacidad).
+                if (!free_block(blk.offset, blk.size, blk.slack)) {
+                    return false;
+                }
+                evictions++;
+                evict_bytes += blk.size;
+                evict_slack_bytes += blk.slack;
+
+                l2_lru_list.erase(blk.lru_it);
+                l2_index.erase(idx_it);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool resolve_sync(uint64_t /* sync_epoch */) {
+        if (effective_sync_mode == sync_mode::UNKNOWN) {
+            // Ningun fill enlazo un backend: no hay transferencia que confirmar.
+            // Devolver false aqui marcaria un fallo de sincronizacion inexistente
+            // al destruir una fuente que nunca se uso.
+            return l2_inflight.empty();
+        }
+        if (effective_sync_mode == sync_mode::HOST_ONLY) {
+            return l2_inflight.empty();
+        }
+        if (effective_sync_mode == sync_mode::CPU_SYNC) {
+            if (!bound_backend || ggml_backend_dev_type(ggml_backend_get_device(bound_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                return false;
+            }
+            ggml_backend_synchronize(bound_backend);
+            return true;
+        }
+        if (effective_sync_mode == sync_mode::CALLBACK_SYNC) {
+#if defined(GGML_USE_VULKAN)
+            if (!bound_backend || !ggml_backend_is_vk(bound_backend)) {
+                return false;
+            }
+#else
+            return false;
+#endif
+            try {
+                ggml_backend_synchronize(bound_backend);
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    void process_inflight_upto(uint64_t sync_epoch) {
+        for (auto it = l2_inflight.begin(); it != l2_inflight.end(); ) {
+            if (it->epoch > sync_epoch) {
+                ++it;
+                continue;
+            }
+            auto b_it = l2_index.find(it->key);
+            if (b_it == l2_index.end()) {
+                enter_fail_stop(fail_reason::inflight_without_block);
+            }
+            nexus_l2_block & blk = b_it->second;
+            if (blk.inflight == 0) {
+                enter_fail_stop(fail_reason::inflight_underflow);
+            }
+            --blk.inflight;
+            stats.uploads_confirmed.fetch_add(1, std::memory_order_relaxed);
+            it = l2_inflight.erase(it);
+        }
+        last_confirmed_epoch = sync_epoch;
+    }
+
+    void synchronize_active_fill() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        // El llamante NO cuenta en programming_fills: solo espera la compuerta.
+        while (gate_closed) {
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+            const uint64_t my_epoch = gate_epoch;
+            cv_gate.wait(lk, [&]{
+                return teardown || aborted || fatal.load(std::memory_order_relaxed) || gate_epoch != my_epoch;
+            });
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+        }
+
+        gate_closed    = true;
+        barrier_active = true;
+
+        cv_quiescent.wait(lk, [&]{
+            return teardown || aborted || fatal.load(std::memory_order_relaxed) || programming_fills == 0;
+        });
+
+        if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
+            if (teardown) {
+                gate_closed = true;
+                barrier_active = false;
+                return;
+            }
+            gate_closed = false;
+            barrier_active = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
+        // Con la compuerta cerrada y programming_fills == 0, l2_inflight es el
+        // conjunto completo de transferencias no confirmadas. Si esta vacio no
+        // hay nada que sincronizar: no se contabiliza una sincronizacion.
+        if (l2_inflight.empty()) {
+            barrier_active = false;
+            gate_closed    = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
+        ++sync_calls;
+        const uint64_t sync_epoch = fill_epoch;
+        lk.unlock();
+
+        const bool sync_ok = resolve_sync(sync_epoch);
+
+        lk.lock();
+        if (!sync_ok) {
+            ++sync_failures;
+            lk.unlock();
+            enter_fail_stop(fail_reason::sync_failed);
+        }
+        if (sync_epoch < last_confirmed_epoch) {
+            // La contabilidad de epochs no puede retroceder: seria imposible
+            // decidir que transferencias confirma esta sincronizacion.
+            lk.unlock();
+            enter_fail_stop(fail_reason::epoch_regression);
+        }
+        process_inflight_upto(sync_epoch);
+
+        if (teardown) {
+            gate_closed = true;
+            barrier_active = false;
+            return;
+        }
+        barrier_active = false;
+        gate_closed    = false;
+        ++gate_epoch;
+        cv_gate.notify_all();
+    }
+
+    void synchronize_external() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        while (gate_closed) {
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+            const uint64_t my_epoch = gate_epoch;
+            cv_gate.wait(lk, [&]{
+                return teardown || aborted || fatal.load(std::memory_order_relaxed) || gate_epoch != my_epoch;
+            });
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+        }
+
+        gate_closed    = true;
+        barrier_active = true;
+
+        cv_quiescent.wait(lk, [&]{
+            return teardown || aborted || fatal.load(std::memory_order_relaxed) || programming_fills == 0;
+        });
+
+        if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
+            if (teardown) {
+                gate_closed = true;
+                barrier_active = false;
+                return;
+            }
+            gate_closed = false;
+            barrier_active = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
+        // Con la compuerta cerrada y programming_fills == 0, l2_inflight es el
+        // conjunto completo de transferencias no confirmadas. Si esta vacio no
+        // hay nada que sincronizar: no se contabiliza una sincronizacion.
+        if (l2_inflight.empty()) {
+            barrier_active = false;
+            gate_closed    = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
+        ++sync_calls;
+        const uint64_t sync_epoch = fill_epoch;
+        lk.unlock();
+
+        const bool sync_ok = resolve_sync(sync_epoch);
+
+        lk.lock();
+        if (!sync_ok) {
+            ++sync_failures;
+            lk.unlock();
+            enter_fail_stop(fail_reason::sync_failed);
+        }
+        if (sync_epoch < last_confirmed_epoch) {
+            // La contabilidad de epochs no puede retroceder: seria imposible
+            // decidir que transferencias confirma esta sincronizacion.
+            lk.unlock();
+            enter_fail_stop(fail_reason::epoch_regression);
+        }
+        process_inflight_upto(sync_epoch);
+
+        if (teardown) {
+            gate_closed = true;
+            barrier_active = false;
+            return;
+        }
+        barrier_active = false;
+        gate_closed    = false;
+        ++gate_epoch;
+        cv_gate.notify_all();
+    }
+
+    // Cierra la compuerta y toma una instantanea del epoch. El llamante debe
+    // ejecutar ggml_backend_synchronize() en el backend enlazado y luego end_sync().
+    void begin_sync() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
+            return;
+        }
+        if (sync_pending) {
+            // begin_sync() no es reentrante: cada begin_sync() debe emparejarse
+            // con su end_sync() antes de volver a llamarlo.
+            LLAMA_LOG_ERROR("nexus-expert-stream: begin_sync() with a synchronization already pending\n");
+            return;
+        }
+        // Sin backend enlazado no hay transferencias que confirmar, y antes del
+        // primer fill tampoco (UNKNOWN).
+        if (effective_sync_mode == sync_mode::HOST_ONLY ||
+            effective_sync_mode == sync_mode::UNKNOWN) {
+            return;
+        }
+
+        while (gate_closed) {
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+            const uint64_t my_epoch = gate_epoch;
+            cv_gate.wait(lk, [&]{
+                return teardown || aborted || fatal.load(std::memory_order_relaxed) || gate_epoch != my_epoch;
+            });
+            if (teardown || aborted || fatal.load(std::memory_order_relaxed)) return;
+        }
+
+        gate_closed    = true;
+        barrier_active = true;
+
+        cv_quiescent.wait(lk, [&]{
+            return teardown || aborted || fatal.load(std::memory_order_relaxed) || programming_fills == 0;
+        });
+
+        if (teardown || aborted || fatal.load(std::memory_order_relaxed)) {
+            gate_closed    = false;
+            barrier_active = false;
+            ++gate_epoch;
+            cv_gate.notify_all();
+            return;
+        }
+
+        sync_epoch_snapshot = fill_epoch;
+        sync_pending        = true;
+    }
+
+    // El llamante ya sincronizo el backend enlazado.
+    void end_sync() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        if (!sync_pending) {
+            return;
+        }
+        sync_pending = false;
+
+        if (sync_epoch_snapshot < last_confirmed_epoch) {
+            // La contabilidad de epochs no puede retroceder: seria imposible
+            // decidir que transferencias confirma esta sincronizacion.
+            lk.unlock();
+            enter_fail_stop(fail_reason::epoch_regression);
+        }
+
+        ++sync_calls;
+        process_inflight_upto(sync_epoch_snapshot);
+
+        barrier_active = false;
+        gate_closed    = false;
+        ++gate_epoch;
+        cv_gate.notify_all();
+    }
+
+    void drain_for_teardown() {
+        std::unique_lock<std::mutex> lk(l2_mutex);
+
+        teardown    = true;
+        frozen      = true;
+        gate_closed = true;
+        sync_pending = false;
+
+        cv_gate.notify_all();
+        cv_quiescent.notify_all();
+
+        cv_idle.wait(lk, [&]{ return active_fills == 0; });
+
+        if (barrier_active) {
+            // Otra hebra esta a mitad de una barrera (begin_sync() sin end_sync()).
+            // Puede haber programado una transferencia y estar fuera del mutex
+            // esperando al backend: cerrar la compuerta NO completa esa
+            // transferencia, y ggml_backend_synchronize() no informa su resultado.
+            // Politica explicita: la arena se retira sin liberarse (cuarentena)
+            // en vez de devolver memoria que el dispositivo puede estar leyendo.
+            // Destruir el objeto mientras otra hebra lo usa viola el contrato de
+            // vida util del llamante; el destructor no puede repararlo.
+            LLAMA_LOG_ERROR("nexus-expert-stream: teardown with an active barrier: "
+                            "the L2 arena is quarantined instead of freed\n");
+            quarantine_arena(fail_reason::lifetime_violation);
+            return;
+        }
+
+        // active_fills == 0 y l2_inflight solo cambia bajo l2_mutex: si esta
+        // vacio no queda ninguna transferencia programada sin confirmar.
+        if (l2_inflight.empty()) {
+            return;
+        }
+
+        ++sync_calls;
+        const uint64_t sync_epoch = fill_epoch;
+        lk.unlock();
+
+        const bool sync_ok = resolve_sync(sync_epoch);
+
+        lk.lock();
+        if (!sync_ok) {
+            // No se puede demostrar que las transferencias pendientes terminaron.
+            // No se libera una arena que el dispositivo podria estar usando: se
+            // deja en cuarentena.
+            ++sync_failures;
+            fatal.store(true, std::memory_order_release);
+            LLAMA_LOG_ERROR("nexus-expert-stream: final synchronize failed during teardown: "
+                            "the L2 arena is quarantined instead of freed\n");
+            quarantine_arena(fail_reason::teardown_sync_failed);
+            return;
+        }
+        process_inflight_upto(sync_epoch);
+    }
+};
+
+struct llama_expert_source::impl::fill_active_guard {
+    llama_expert_source::impl * im = nullptr;
+    bool active_armed      = false;
+    bool programming_armed = false;
+
+    explicit fill_active_guard(llama_expert_source::impl * p) : im(p) {}
+    void arm_active()      noexcept { active_armed = true; }
+    void arm_programming() noexcept { programming_armed = true; }
+
+    ~fill_active_guard() {
+        if (active_armed && im) {
+            std::lock_guard<std::mutex> lk(im->l2_mutex);
+            --im->active_fills;
+            if (programming_armed) {
+                --im->programming_fills;
+                programming_armed = false;
+            }
+            if (im->active_fills == 0) {
+                im->cv_idle.notify_all();
+            }
+            im->cv_quiescent.notify_all();
         }
     }
 };
 
-std::unique_ptr<llama_expert_source> llama_expert_source::create(
+#if defined(GGML_NEXUS_TEST_HOOKS)
+void llama_expert_source::test_arm_alloc_failure(long long phases) {
+    g_nexus_test_alloc_fail.store(phases, std::memory_order_relaxed);
+}
+
+void llama_expert_source::test_disarm_alloc_failure() {
+    g_nexus_test_alloc_fail.store(-1, std::memory_order_relaxed);
+}
+
+void llama_expert_source::test_arm_restore_failure(long long phases) {
+    g_nexus_test_restore_fail.store(phases, std::memory_order_relaxed);
+}
+
+void llama_expert_source::test_disarm_restore_failure() {
+    g_nexus_test_restore_fail.store(-1, std::memory_order_relaxed);
+}
+
+void llama_expert_source::test_arm_allocblock_failure(long long phases) {
+    g_nexus_test_allocblock_fail.store(phases, std::memory_order_relaxed);
+}
+
+void llama_expert_source::test_disarm_allocblock_failure() {
+    g_nexus_test_allocblock_fail.store(-1, std::memory_order_relaxed);
+}
+
+void llama_expert_source::test_pause_loader() {
+    g_test_pause_loader.store(true, std::memory_order_release);
+}
+
+void llama_expert_source::test_release_loader() {
+    g_test_loader_paused.store(false, std::memory_order_release);
+    g_test_pause_loader.store(false, std::memory_order_release);
+    g_test_pause_cv.notify_all();
+}
+
+bool llama_expert_source::test_loader_paused() {
+    return g_test_loader_paused.load(std::memory_order_acquire);
+}
+
+bool llama_expert_source::test_free_block(size_t offset, size_t size, size_t slack) {
+    std::lock_guard<std::mutex> lk(pimpl->l2_mutex);
+    return pimpl->free_block(offset, size, slack);
+}
+#endif // GGML_NEXUS_TEST_HOOKS
+
+struct llama_expert_create_result llama_expert_source::create(
         const llama_expert_model_meta & meta,
         const config & cfg) {
 
-    auto p = std::make_unique<impl>();
+    llama_expert_create_result result;
+
+    if (::getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE") != nullptr) {
+        LLAMA_LOG_ERROR("nexus: GGML_VK_ASYNC_USE_TRANSFER_QUEUE must be unset for D-0; dedicated transfer queue excluded\n");
+        result.status = llama_expert_create_status::IO_ERROR;
+        return result;
+    }
+    if (cfg.path_2) {
+        LLAMA_LOG_ERROR("nexus: config.path_2 is excluded until X-02 is certified\n");
+        result.status = llama_expert_create_status::IO_ERROR;
+        return result;
+    }
+
+    std::unique_ptr<quarantine_node> q_node;
+    try {
+        quarantine_node * q_raw = new (std::nothrow) quarantine_node();
+        if (!q_raw) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: failed to preallocate quarantine node\n");
+            result.status = llama_expert_create_status::OUT_OF_MEMORY;
+            return result;
+        }
+        q_node.reset(q_raw);
+    } catch (...) {
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
+
+    std::unique_ptr<impl> p;
+    try {
+        p = std::make_unique<impl>();
+        p->preallocated_quarantine = std::move(q_node);
+    } catch (...) {
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
+
+    try {
+
     p->cfg = cfg;
 
-    // 1. Abrir shards
+    // fase asignadora 0: vector de shards
+#if defined(GGML_NEXUS_TEST_HOOKS)
+    if (nexus_test_fail_alloc()) {
+        throw std::bad_alloc();
+    }
+#endif
     p->shards.resize(meta.files.size());
     for (size_t i = 0; i < meta.files.size(); ++i) {
         p->shards[i].path = meta.files[i].path;
@@ -237,96 +1330,209 @@ std::unique_ptr<llama_expert_source> llama_expert_source::create(
         if (p->shards[i].fd < 0) {
             LLAMA_LOG_ERROR("nexus-expert-stream: cannot open shard %s: %s\n",
                 p->shards[i].path.c_str(), strerror(errno));
-            return nullptr;
+            result.status = llama_expert_create_status::IO_ERROR;
+            return result;
         }
     }
 
-    // 2. Indexar tensores y calcular dimensiones máximas
+    // fase asignadora 1: copia del mapa de metadatos
+#if defined(GGML_NEXUS_TEST_HOOKS)
+    if (nexus_test_fail_alloc()) {
+        throw std::bad_alloc();
+    }
+#endif
     p->extents = meta.tensors;
+
+    // B4: la identidad gate/up vs down viene de metadatos explicitos del tensor
+    // (rol y capa), nunca de un umbral de tamano. Un "par" es el conjunto de
+    // expertos que una capa necesita: gate_up, o gate + up, mas down.
+    struct layer_expert_bytes {
+        size_t total    = 0;
+        bool   has_down = false;
+        bool   has_up   = false;
+    };
+    std::map<int32_t, layer_expert_bytes> per_layer;
+    bool capacity_known = true;
+
+    // fase asignadora 2: estructuras auxiliares de clasificacion/per_layer
+#if defined(GGML_NEXUS_TEST_HOOKS)
+    if (nexus_test_fail_alloc()) {
+        throw std::bad_alloc();
+    }
+#endif
+
+    // Bloqueante B: clasificar el modelo antes de decidir. Un candidato MoE con
+    // metadatos INVALID no es "ausencia de soporte": es corrupcion y debe
+    // propagarse como error, no como fallback mmap.
+    size_t n_invalid = 0;
+    size_t n_supported = 0;
+    size_t n_unsupported = 0;
+
     for (const auto & kv : p->extents) {
-        if (!kv.second.is_supported) {
+        const auto & m = kv.second;
+        switch (m.validation) {
+            case llama_expert_tensor_validation::INVALID:
+                ++n_invalid;
+                break;
+            case llama_expert_tensor_validation::VALID:
+                ++n_supported;
+                break;
+            case llama_expert_tensor_validation::UNSUPPORTED:
+                ++n_unsupported;
+                break;
+        }
+        if (m.is_supported) {
+            ++n_supported;
+        }
+        // Revalidar los limites que este fuente servira. Un shard fuera de rango
+        // o un extent fuera del archivo no puede declararse "soportado": seria
+        // un fallback silencioso sobre metadatos corruptos.
+        if (m.is_supported) {
+            if (m.shard_idx < 0 || (size_t) m.shard_idx >= p->shards.size()) {
+                ++n_invalid;
+                continue;
+            }
+            const uint64_t shard_sz = p->shards[m.shard_idx].size;
+            if (m.expert_bytes == 0 || m.expert_stride < m.expert_bytes ||
+                m.n_expert <= 0 ||
+                (m.expert_stride != 0 &&
+                 (uint64_t) m.n_expert > (UINT64_MAX - m.base_offset) / m.expert_stride) ||
+                m.base_offset > shard_sz ||
+                (uint64_t) m.expert_bytes > shard_sz - m.base_offset) {
+                ++n_invalid;
+            }
+        }
+    }
+
+    if (n_invalid > 0) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: %zu MoE tensor(s) with invalid metadata; "
+                        "refusing to fall back to mmap\n", n_invalid);
+        result.status = llama_expert_create_status::INVALID_METADATA;
+        return result;
+    }
+    if (n_supported == 0) {
+        LLAMA_LOG_INFO("nexus-expert-stream: no supported MoE expert tensors (%zu unsupported); "
+                       "Nexus disabled, mmap fallback allowed\n", n_unsupported);
+        result.status = llama_expert_create_status::NO_SUPPORTED_TENSORS;
+        return result;
+    }
+
+    for (const auto & kv : p->extents) {
+        const auto & m = kv.second;
+        if (!m.is_supported) {
             continue;
         }
-        size_t sz = (size_t) kv.second.expert_bytes;
-        p->max_expert_size = std::max(p->max_expert_size, sz);
-        if (sz >= 2000000) {
-            p->size_gate_up = sz; // tensor mayor (~2,23 MiB en Gemma 4)
+        p->max_expert_size = std::max(p->max_expert_size, (size_t) m.expert_bytes);
+
+        if (m.layer_id < 0 || m.role == llama_expert_tensor_role::UNKNOWN) {
+            // sin rol/capa explicitos no se sabe que tensores forman un par
+            capacity_known = false;
+            continue;
+        }
+        auto & lb = per_layer[m.layer_id];
+        lb.total += (size_t) m.expert_bytes;
+        if (m.role == llama_expert_tensor_role::DOWN) {
+            lb.has_down = true;
         } else {
-            p->size_down = sz;    // tensor menor (~1,11 MiB en Gemma 4)
+            lb.has_up = true;
         }
     }
 
     if (p->max_expert_size == 0) {
         LLAMA_LOG_ERROR("nexus-expert-stream: no supported MoE expert tensors found\n");
-        return nullptr;
+        result.status = llama_expert_create_status::NO_SUPPORTED_TENSORS;
+        return result;
     }
 
-    if (p->size_gate_up == 0) p->size_gate_up = p->max_expert_size;
-    if (p->size_down == 0)    p->size_down    = p->max_expert_size;
-
-    // 3. Inicializar Caché L2 Warm RAM (Cálculo corregido: 320 pares exactos para 1024 MiB)
-    const size_t pair_bytes = p->size_gate_up + p->size_down;
-    if (cfg.ram_warm_bytes >= pair_bytes) {
-        p->max_l2_pairs = cfg.ram_warm_bytes / pair_bytes;
-        // Si el usuario especificó el default de 1024 MiB, asegurar exactamente 320 pares
-        if (cfg.ram_warm_bytes == 1024ull * 1024 * 1024) {
-            p->max_l2_pairs = std::min<size_t>(p->max_l2_pairs, 320);
+    p->pair_bytes = 0;
+    if (capacity_known && !per_layer.empty()) {
+        for (const auto & kv : per_layer) {
+            if (!kv.second.has_down || !kv.second.has_up) {
+                // una capa sin ambas mitades: el par no esta identificado
+                capacity_known = false;
+                break;
+            }
+            p->pair_bytes = std::max(p->pair_bytes, kv.second.total);
         }
-
-        p->arena_gate_up.resize(p->max_l2_pairs * p->size_gate_up);
-        p->arena_down.resize(p->max_l2_pairs * p->size_down);
-        p->gate_up_free.assign(p->max_l2_pairs, true);
-        p->down_free.assign(p->max_l2_pairs, true);
-
-        const size_t total_l2_allocated = (p->max_l2_pairs * p->size_gate_up) + (p->max_l2_pairs * p->size_down);
-        LLAMA_LOG_INFO(
-            "nexus-expert-stream: L2 warm cache configured: %zu pairs (%.2f MiB total | gate_up: %zu, down: %zu)\n",
-            p->max_l2_pairs, total_l2_allocated / 1048576.0, p->size_gate_up, p->size_down);
-    } else {
-        LLAMA_LOG_INFO("nexus-expert-stream: L2 warm cache disabled\n");
+    }
+    if (!capacity_known) {
+        p->pair_bytes = 0;
+        LLAMA_LOG_INFO("nexus-expert-stream: expert pair size unknown (tensor role/layer not provided), "
+                       "L2 capacity in pairs not reported\n");
     }
 
-    // 4. Inicializar Staging Ring Vulkan Host-Pinned
-    size_t ring_slots_count = std::max<size_t>(4, cfg.ring_bytes / p->max_expert_size);
-    p->ring_slots.resize(ring_slots_count);
+    p->arena_bytes = cfg.ram_warm_bytes;
+    p->alignment   = cfg.alignment > 0 ? cfg.alignment : 64;
 
-    ggml_backend_buffer_type_t buft = nullptr;
-#if defined(GGML_USE_VULKAN)
-    buft = ggml_backend_vk_host_buffer_type();
+    // Cota de cordura: una arena RAM por encima de 1 TiB o de tamano cero no
+    // puede ser una configuracion valida del cache. Se rechaza ANTES de llamar
+    // al allocator para no provocar un fallo de tamano en el propio malloc.
+    if (p->arena_bytes == 0 || p->arena_bytes > ((size_t) 1 << 40)) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: unreasonable arena size requested: %zu\n", p->arena_bytes);
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
+
+    // Inicializar reserva host independiente con posix_memalign
+    constexpr size_t MAX_ALIGN = ((size_t) 1) << (std::numeric_limits<size_t>::digits - 1);
+    if (p->alignment == 0 || (p->alignment & (p->alignment - 1)) != 0 ||
+        p->alignment % sizeof(void *) != 0 || p->alignment > MAX_ALIGN) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: invalid alignment requested: %zu\n", p->alignment);
+        result.status = llama_expert_create_status::IO_ERROR;
+        return result;
+    }
+
+    int res = posix_memalign(&p->arena_base, p->alignment, p->arena_bytes);
+    if (res != 0 || !p->arena_base) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: failed to allocate L2 arena (%zu bytes): %s\n",
+            p->arena_bytes, strerror(res));
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
+
+    p->owns_arena = true;
+    p->arena_buf  = nullptr;
+    p->mem_kind   = llama_expert_mem_kind::PAGEABLE_HOST;
+
+    // fase asignadora 3: nodo inicial de free_holes
+#if defined(GGML_NEXUS_TEST_HOOKS)
+    if (nexus_test_fail_alloc()) {
+        throw std::bad_alloc();
+    }
 #endif
+    p->free_holes[0] = p->arena_bytes;
+    p->aligned_bytes = 0;
+    p->slack_bytes   = 0;
+    p->free_bytes    = p->arena_bytes;
 
-    for (size_t i = 0; i < ring_slots_count; ++i) {
-        p->ring_slots[i].size = p->max_expert_size;
-        p->ring_slots[i].busy = false;
-        p->ring_slots[i].layer_id = -1;
+    LLAMA_LOG_INFO(
+        "nexus-expert-stream: L2 single arena initialized: %.2f MiB (alignment: %zu, first-fit coalescing)\n",
+        (double) p->arena_bytes / (1024.0 * 1024.0), p->alignment);
 
-        if (buft) {
-            p->ring_slots[i].buf = ggml_backend_buft_alloc_buffer(buft, p->max_expert_size);
-            if (p->ring_slots[i].buf) {
-                p->ring_slots[i].ptr = ggml_backend_buffer_get_base(p->ring_slots[i].buf);
-            }
-        }
-
-        if (!p->ring_slots[i].ptr) {
-            int res = posix_memalign(&p->ring_slots[i].ptr, 4096, p->max_expert_size);
-            if (res != 0) {
-                LLAMA_LOG_ERROR("nexus-expert-stream: failed to allocate staging ring memory\n");
-                return nullptr;
-            }
-        }
+    // fase asignadora 4: objeto fuente
+#if defined(GGML_NEXUS_TEST_HOOKS)
+    if (nexus_test_fail_alloc()) {
+        throw std::bad_alloc();
     }
-
-    LLAMA_LOG_INFO("nexus-expert-stream: staging ring initialized: %zu slots (%.2f MiB total)\n",
-        ring_slots_count, (ring_slots_count * p->max_expert_size) / 1048576.0);
-
-    auto res = std::make_unique<llama_expert_source>();
-    res->pimpl = std::move(p);
-    return res;
+#endif
+    result.status = llama_expert_create_status::SUCCESS;
+    result.source = std::make_unique<llama_expert_source>();
+    result.source->pimpl = std::move(p);
+    return result;
+    } catch (const std::bad_alloc &) {
+        // p (unique_ptr) se destruye y cierra los shards ya abiertos: no quedan
+        // recursos colgados. Un fallo de memoria nunca se clasifica como IO_ERROR.
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    } catch (...) {
+        result.status = llama_expert_create_status::IO_ERROR;
+        return result;
+    }
 }
 
 llama_expert_source::~llama_expert_source() = default;
 
-llama_expert_fill_status llama_expert_source::fill_expert(
+llama_expert_fill_status llama_expert_source::fill_expert_impl(
         ggml_backend_t backend,
         ggml_tensor * bank,
         int32_t il,
@@ -336,200 +1542,580 @@ llama_expert_fill_status llama_expert_source::fill_expert(
         size_t expert_size) {
 
     auto & p = *pimpl;
-    p.last_backend = backend;
+    impl::fill_active_guard guard(&p);
+
+    {
+        std::lock_guard<std::mutex> lk(p.l2_mutex);
+        if (p.teardown || p.frozen || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+            return llama_expert_fill_status::IO_ERROR;
+        }
+        ++p.active_fills;
+        guard.arm_active();
+
+        // B3: Comprobación estricta de backend
+        if (p.bound_backend != nullptr && backend != nullptr && p.bound_backend != backend) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: backend mismatch: operation requested on a different backend\n");
+            return llama_expert_fill_status::IO_ERROR;
+        }
+
+        // Enlazar backend y clasificar modo en el primer fill
+        if (!p.bound_backend && backend) {
+            p.bound_backend = backend;
+#if defined(GGML_USE_VULKAN)
+            if (ggml_backend_is_vk(backend)) {
+                p.effective_sync_mode = impl::sync_mode::CALLBACK_SYNC;
+                p.init_backend_memory(backend);
+            } else
+#endif
+            {
+                p.effective_sync_mode = impl::sync_mode::CPU_SYNC;
+            }
+        } else if (!p.bound_backend && !backend) {
+            p.effective_sync_mode = impl::sync_mode::HOST_ONLY;
+        }
+    }
 
     auto it_ext = p.extents.find(w);
-    if (it_ext == p.extents.end() || !it_ext->second.is_supported) {
+    if (it_ext == p.extents.end()) {
         return llama_expert_fill_status::FALLBACK_ALLOWED;
     }
+    if (it_ext->second.validation == llama_expert_tensor_validation::INVALID) {
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (it_ext->second.validation == llama_expert_tensor_validation::UNSUPPORTED &&
+        !it_ext->second.is_supported) {
+        return llama_expert_fill_status::NOT_SUPPORTED;
+    }
+    // Los fixtures/consumidores antiguos pueden omitir validation y conservar
+    // is_supported=true; se acepta esa compatibilidad solo para esos metadatos.
 
     const auto & ext = it_ext->second;
-    p.stats.fills++;
 
-    const void * src_data = nullptr;
-    void * stage_used = nullptr;
-
-    const bool is_gate_up = (expert_size == p.size_gate_up);
-    const size_t arena_type = is_gate_up ? 0 : 1;
-
-    // --- 1. Consulta en L2 Warm Cache ---
-    impl::l2_key key { il, w, expert };
-    if (p.max_l2_pairs > 0) {
-        std::lock_guard<std::mutex> lock(p.l2_mutex);
-        auto it_l2 = p.l2_index.find(key);
-        if (it_l2 != p.l2_index.end()) {
-            p.stats.l2_hits++;
-            it_l2->second.pinned = true;
-            it_l2->second.layer_id = il;
-
-            // Mover al frente de la lista LRU
-            p.l2_lru_list.erase(it_l2->second.lru_it);
-            p.l2_lru_list.push_front(key);
-            it_l2->second.lru_it = p.l2_lru_list.begin();
-
-            if (arena_type == 0) {
-                src_data = p.arena_gate_up.data() + it_l2->second.slot_idx * p.size_gate_up;
-            } else {
-                src_data = p.arena_down.data() + it_l2->second.slot_idx * p.size_down;
-            }
+    // B3: validar los metadatos ANTES de calcular offsets. pread_full() no puede
+    // detectar un offset que ya se desbordo al calcularlo, y un extent invalido
+    // nunca debe convertirse en una lectura mmap silenciosa.
+    if (ext.shard_idx < 0 || (size_t) ext.shard_idx >= p.shards.size()) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: invalid shard index %d for %s\n",
+                ext.shard_idx, ggml_get_name(w));
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    const auto & shard = p.shards[ext.shard_idx];
+    if (shard.fd < 0) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: shard %s is not open\n", shard.path.c_str());
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (expert < 0 || ext.n_expert <= 0 || expert >= ext.n_expert) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: expert %d out of range [0, %d) for %s\n",
+                expert, ext.n_expert, ggml_get_name(w));
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (ext.expert_bytes == 0 || ext.expert_stride < ext.expert_bytes) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: invalid expert layout for %s (bytes %" PRIu64 ", stride %" PRIu64 ")\n",
+                ggml_get_name(w), ext.expert_bytes, ext.expert_stride);
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (expert_size != (size_t) ext.expert_bytes) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: expert size %zu does not match the extent %" PRIu64 " of %s\n",
+                expert_size, ext.expert_bytes, ggml_get_name(w));
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    // expert * expert_stride + base_offset sin desbordar 64 bits
+    if ((uint64_t) expert > (UINT64_MAX - ext.base_offset) / ext.expert_stride) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: offset overflow for %s (expert %d)\n", ggml_get_name(w), expert);
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    const uint64_t file_offset = ext.base_offset + (uint64_t) expert * ext.expert_stride;
+    if (file_offset > shard.size || (uint64_t) expert_size > shard.size - file_offset) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: extent of %s (expert %d) is outside shard %s\n",
+                ggml_get_name(w), expert, shard.path.c_str());
+        return llama_expert_fill_status::INVALID_EXTENT;
+    }
+    if (backend != nullptr) {
+        if (bank == nullptr) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: no bank for %s on a backend transfer\n", ggml_get_name(w));
+            return llama_expert_fill_status::INVALID_EXTENT;
+        }
+        const size_t bank_bytes = ggml_nbytes(bank);
+        if (slot_offset > bank_bytes || expert_size > bank_bytes - slot_offset) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: slot of %s does not fit the bank (%zu + %zu > %zu)\n",
+                    ggml_get_name(w), slot_offset, expert_size, bank_bytes);
+            return llama_expert_fill_status::INVALID_EXTENT;
         }
     }
 
-    // --- 2. Lectura L3 NVMe ante Miss ---
-    if (!src_data) {
-        p.stats.l2_misses++;
-        stage_used = p.acquire_stage(expert_size, il);
-        if (!stage_used) {
-            return llama_expert_fill_status::OUT_OF_MEMORY;
+    if (expert_size > p.arena_bytes) {
+        return llama_expert_fill_status::NOT_SUPPORTED;
+    }
+
+    // --- 1+2. Coordinación de carga (bloqueante A) ---
+    // La búsqueda, la reclamación de la clave y la inserción del bloque LOADING
+    // ocurren en una única sección crítica. Un segundo hilo solo puede observar
+    // RESIDENT o LOADING; si observa LOADING espera en cv_loading sin reclamar
+    // la clave, de modo que una clave tiene exactamente un cargador.
+    bool   is_loader   = false;
+    size_t blk_offset  = 0;
+    size_t alloc_off   = 0;
+    size_t alloc_sz    = 0;
+    size_t alloc_slk   = 0;
+    const llama_expert_key key { il, reinterpret_cast<uintptr_t>(w), expert };
+
+    for (;;) {
+        std::unique_lock<std::mutex> lk(p.l2_mutex);
+        if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+            return llama_expert_fill_status::IO_ERROR;
         }
 
-        const int fd = p.shards[ext.shard_idx].fd;
-        const uint64_t file_offset = ext.base_offset + (uint64_t) expert * ext.expert_stride;
-        const uint64_t file_size   = p.shards[ext.shard_idx].size;
+        auto it = p.l2_index.find(key);
+        if (it != p.l2_index.end()) {
+            if (it->second.content == llama_expert_content::RESIDENT) {
+                p.stats.l2_hits++;
+                nexus_l2_block & blk = it->second;
+                blk.pin_layers++;
+                blk.lru_tick = ++p.current_lru_tick;
+                blk_offset = blk.offset;
+
+                p.l2_lru_list.erase(blk.lru_it);
+                p.l2_lru_list.push_front(key);
+                blk.lru_it = p.l2_lru_list.begin();
+                break;
+            }
+            if (it->second.content == llama_expert_content::LOADING) {
+                // Otro hilo está cargando esta clave: esperar en cv_loading. No
+                // se reclama la clave ni se incrementan misses.
+                p.cv_loading.wait(lk, [&]{
+                    return p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed) ||
+                        p.l2_index.find(key) == p.l2_index.end() ||
+                        p.l2_index[key].content != llama_expert_content::LOADING;
+                });
+                continue;
+            }
+            // INVALID o estado anómalo
+            return llama_expert_fill_status::IO_ERROR;
+        }
+
+        // Clave ausente: solo este hilo puede reclamarla ahora (mutex tomado).
+        // Miss contabilizado bajo el mutex; nadie más cuenta esta clave.
+        p.stats.l2_misses++;
+        is_loader = true;
+
+        // Nodo retenido durante la publicacion: si alloc_block consume un hueco
+        // completo, este nodo permite un rollback no-throw (reinsert sin asignar).
+        std::map<size_t, size_t>::node_type restore_node;
+
+        alloc_result ar = p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk, &restore_node);
+        while (ar == alloc_result::NO_CAPACITY) {
+            // Capacidad insuficiente real: se puede evictar y reintentar.
+            if (!p.evict_lru_victim()) {
+                lk.unlock();
+                p.synchronize_active_fill();
+                lk.lock();
+
+                if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+                    return llama_expert_fill_status::IO_ERROR;
+                }
+                if (!p.evict_lru_victim()) {
+                    p.alloc_fail++;
+                    p.oom_rejects++;
+                    return llama_expert_fill_status::OUT_OF_MEMORY;
+                }
+            }
+            ar = p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk, &restore_node);
+        }
+        if (ar == alloc_result::INTERNAL_FAILURE) {
+            // Fallo interno: fatal activo y arena en cuarentena. NO se evicta, no
+            // se reintenta, no se toca la arena retirada. Se propaga IO_ERROR.
+            return llama_expert_fill_status::IO_ERROR;
+        }
+
+        // B3: el destino completo debe caber en la arena. El allocator no
+        // deberia entregar un rango fuera de ella; si lo hiciera, se
+        // devuelve el hueco y se rechaza el extent en vez de escribir fuera.
+        if (alloc_off > p.arena_bytes || alloc_sz > p.arena_bytes - alloc_off ||
+            expert_size > alloc_sz) {
+            p.alloc_fail++;
+            if (!p.restore_alloc(alloc_off, alloc_sz, alloc_slk, std::move(restore_node))) {
+                // Politica terminal: no se continua con una region sin propietario.
+                return p.fail_rollback("invalid extent");
+            }
+            return llama_expert_fill_status::INVALID_EXTENT;
+        }
+
+        nexus_l2_block blk;
+        blk.offset     = alloc_off;
+        blk.size       = alloc_sz;
+        blk.slack      = alloc_slk;
+        blk.req_bytes  = expert_size;
+        blk.content    = llama_expert_content::LOADING;
+        blk.pin_layers = 1;
+        blk.inflight   = 0;
+        blk.lru_tick   = ++p.current_lru_tick;
+
+        try {
+#if defined(GGML_NEXUS_TEST_HOOKS)
+            // inyeccion TEST-ONLY: fallo del nodo LRU en el punto real de la
+            // publicacion; el catch aplica restore_alloc (no-throw).
+            if (nexus_test_fail_alloc()) {
+                throw std::bad_alloc();
+            }
+#endif
+            p.l2_lru_list.push_front(key);
+            blk.lru_it = p.l2_lru_list.begin();
+#if defined(GGML_NEXUS_TEST_HOOKS)
+            // inyeccion TEST-ONLY: fallo del nodo del indice en el punto real.
+            if (nexus_test_fail_alloc()) {
+                throw std::bad_alloc();
+            }
+#endif
+            const auto inserted = p.l2_index.emplace(key, blk);
+            if (!inserted.second) {
+                // Inalcanzable bajo el mismo mutex (la clave no existia al mirar),
+                // pero se mantiene como red de seguridad: restaurar y continuar.
+                p.l2_lru_list.erase(blk.lru_it);
+                p.alloc_fail++;
+                if (!p.restore_alloc(alloc_off, alloc_sz, alloc_slk, std::move(restore_node))) {
+                    return p.fail_rollback("duplicate key");
+                }
+                is_loader = false;
+                lk.unlock();
+                continue;
+            }
+        } catch (const std::bad_alloc &) {
+            // El hueco y los contadores se restauran; no queda una clave
+            // parcialmente publicada ni una region huerfana.
+            if (!p.l2_lru_list.empty() && p.l2_lru_list.front().layer_id == key.layer_id &&
+                p.l2_lru_list.front().tensor_id == key.tensor_id &&
+                p.l2_lru_list.front().expert_id == key.expert_id) {
+                p.l2_lru_list.pop_front();
+            }
+            if (!p.restore_alloc(alloc_off, alloc_sz, alloc_slk, std::move(restore_node))) {
+                return p.fail_rollback("allocation failure");
+            }
+            return llama_expert_fill_status::OUT_OF_MEMORY;
+        } catch (...) {
+            // Mismo rollback para cualquier otra excepcion de publicacion.
+            if (!p.l2_lru_list.empty() && p.l2_lru_list.front().layer_id == key.layer_id &&
+                p.l2_lru_list.front().tensor_id == key.tensor_id &&
+                p.l2_lru_list.front().expert_id == key.expert_id) {
+                p.l2_lru_list.pop_front();
+            }
+            if (!p.restore_alloc(alloc_off, alloc_sz, alloc_slk, std::move(restore_node))) {
+                return p.fail_rollback("unexpected exception");
+            }
+            return llama_expert_fill_status::OUT_OF_MEMORY;
+        }
+        blk_offset = alloc_off;
+        break;
+    }
+
+    // --- 3. Carga NVMe (solo el hilo que reclamo la clave) ---
+    if (is_loader) {
+        // Mientras el bloque existe (LOADING/RESIDENT), la arena no puede
+        // liberarse ni sustituirse. Un hilo que llegue a una barrera durante
+        // esta ventana se pone a la espera; nunca ve la arena sin dueño.
+        {
+            std::unique_lock<std::mutex> lk(p.l2_mutex);
+            if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+                return llama_expert_fill_status::IO_ERROR;
+            }
+        }
+#if defined(GGML_NEXUS_TEST_HOOKS)
+        // pausa determinista TEST-ONLY: permite a la prueba colocar esperadores
+        // en cv_loading mientras este hilo esta en la ventana LOADING.
+        nexus_test_pause_loader();
+#endif
+        // Re-chequear el estado terminal tras una eventual espera: si la fuente
+        // entro en fatal mientras el hilo estaba en la ventana LOADING, no se
+        // publica un bloque RESIDENT ni se devuelve LOADED.
+        {
+            std::unique_lock<std::mutex> lk(p.l2_mutex);
+            if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+                return llama_expert_fill_status::IO_ERROR;
+            }
+        }
+        void * dst_ptr = static_cast<uint8_t *>(p.arena_base) + blk_offset;
 
         const auto t0 = std::chrono::steady_clock::now();
-        int64_t n_read = llama_expert_pread_full(fd, stage_used, expert_size, file_offset, file_size);
+        int64_t n_read = llama_expert_pread_full(shard.fd, dst_ptr, expert_size, file_offset, shard.size);
         const auto t1 = std::chrono::steady_clock::now();
 
         if (n_read != (int64_t) expert_size) {
-            LLAMA_LOG_ERROR("nexus-expert-stream: pread_full error (%zd) for %s exp %d\n",
-                (ssize_t) n_read, ggml_get_name(w), expert);
+            LLAMA_LOG_ERROR("nexus-expert-stream: pread_full failed for %s exp %d\n", ggml_get_name(w), expert);
+            {
+                std::lock_guard<std::mutex> lk(p.l2_mutex);
+                auto it = p.l2_index.find(key);
+                if (it != p.l2_index.end()) {
+                    if (!p.free_block(it->second.offset, it->second.size, it->second.slack)) {
+                        // No se pudo devolver el hueco (OOM): el bloque se
+                        // conserva marcado INVALID para que los esperadores no lo
+                        // reutilicen, y la contabilidad sigue siendo coherente.
+                        it->second.content = llama_expert_content::INVALID;
+                        p.cv_loading.notify_all();
+                        return llama_expert_fill_status::IO_ERROR;
+                    }
+                    p.l2_lru_list.erase(it->second.lru_it);
+                    p.l2_index.erase(it);
+                }
+                p.cv_loading.notify_all(); // B2: Despertar cualquier hilo que esperaba
+            }
             return llama_expert_fill_status::IO_ERROR;
         }
 
         const uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         p.stats.proc_bytes += expert_size;
+        p.stats.completed_reads.fetch_add(1, std::memory_order_relaxed);
         p.stats.io_us_total += us;
 
         uint64_t cur_max = p.stats.io_us_max.load();
-        while (us > cur_max && !p.stats.io_us_max.compare_exchange_weak(cur_max, us));
+        while (us > cur_max && !p.stats.io_us_max.compare_exchange_weak(cur_max, us)) {
+        }
 
-        // Verificación byte a byte contra w->data si está habilitado
-        if (p.cfg.verify && w->data) {
-            const uint8_t * ref = (const uint8_t *) w->data + expert * ext.expert_stride;
-            if (memcmp(stage_used, ref, expert_size) == 0) {
-                p.stats.verify_ok++;
-            } else {
-                p.stats.verify_fail++;
-                LLAMA_LOG_ERROR("nexus-expert-stream: VERIFY FAILED for %s layer %d exp %d\n",
-                    ggml_get_name(w), il, expert);
+        // Transición atómica de LOADING a RESIDENT
+        {
+            std::lock_guard<std::mutex> lk(p.l2_mutex);
+            auto it = p.l2_index.find(key);
+            if (it != p.l2_index.end()) {
+                it->second.content = llama_expert_content::RESIDENT;
+            }
+            p.cv_loading.notify_all(); // B2: Notificar a hilos esperando por esta clave
+        }
+    }
+
+    // --- 3. Programación de la transferencia VRAM con Protocolo de Barrera ---
+    if (backend && bank) {
+        std::unique_lock<std::mutex> lk(p.l2_mutex);
+
+        if (p.fatal.load(std::memory_order_relaxed)) {
+            return llama_expert_fill_status::IO_ERROR;
+        }
+
+        // Esta hebra aun NO programa nada: no cuenta en programming_fills, solo
+        // espera a que la barrera en curso abra la compuerta.
+        while (p.gate_closed) {
+            if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+                return llama_expert_fill_status::IO_ERROR;
+            }
+            const uint64_t my_epoch = p.gate_epoch;
+            p.cv_gate.wait(lk, [&]{
+                return p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed) || p.gate_epoch != my_epoch;
+            });
+            if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
                 return llama_expert_fill_status::IO_ERROR;
             }
         }
 
-        // Inserción en L2 Warm Cache
-        if (p.max_l2_pairs > 0) {
-            std::lock_guard<std::mutex> lock(p.l2_mutex);
-            auto & free_vec = is_gate_up ? p.gate_up_free : p.down_free;
-            uint8_t * arena_base = is_gate_up ? p.arena_gate_up.data() : p.arena_down.data();
-            const size_t slot_bytes = is_gate_up ? p.size_gate_up : p.size_down;
-
-            size_t slot_idx = size_t(-1);
-
-            // Buscar slot libre
-            for (size_t i = 0; i < p.max_l2_pairs; ++i) {
-                if (free_vec[i]) {
-                    slot_idx = i;
-                    free_vec[i] = false;
-                    break;
-                }
-            }
-
-            // Si está llena la arena, buscar víctima LRU no-pinned del mismo tipo
-            if (slot_idx == size_t(-1)) {
-                for (auto it = p.l2_lru_list.rbegin(); it != p.l2_lru_list.rend(); ++it) {
-                    auto it_map = p.l2_index.find(*it);
-                    if (it_map != p.l2_index.end() && it_map->second.arena_type == arena_type && !it_map->second.pinned) {
-                        slot_idx = it_map->second.slot_idx;
-                        p.l2_lru_list.erase(it_map->second.lru_it);
-                        p.l2_index.erase(it_map);
-                        break;
-                    }
-                }
-            }
-
-            if (slot_idx != size_t(-1)) {
-                uint8_t * dst_l2 = arena_base + slot_idx * slot_bytes;
-                memcpy(dst_l2, stage_used, expert_size);
-
-                p.l2_lru_list.push_front(key);
-                impl::l2_entry entry;
-                entry.arena_type = arena_type;
-                entry.slot_idx   = slot_idx;
-                entry.pinned     = true;
-                entry.layer_id   = il;
-                entry.lru_it     = p.l2_lru_list.begin();
-
-                p.l2_index[key] = entry;
-            }
+        if (p.fatal.load(std::memory_order_relaxed)) {
+            return llama_expert_fill_status::IO_ERROR;
         }
 
-        src_data = stage_used;
-    }
+        // Protección defensiva contra overflow de epochs
+        if (p.fill_epoch == UINT64_MAX) {
+            p.enter_fail_stop(fail_reason::epoch_overflow);
+        }
 
-    // --- 3. Programación de la transferencia asíncrona hacia VRAM ---
-    if (backend && bank) {
-        ggml_backend_tensor_set_async(backend, bank, src_data, slot_offset, expert_size);
+        // La transferencia solo puede programarse si el bloque RESIDENT sigue
+        // existiendo y coincide exactamente con el rango que se va a leer.
+        // Registrar primero el inflight protege la arena frente a eviction y
+        // permite que la barrera lo confirme por epoch.
+        auto it = p.l2_index.find(key);
+        if (it == p.l2_index.end() ||
+            it->second.content != llama_expert_content::RESIDENT ||
+            it->second.offset != blk_offset ||
+            it->second.req_bytes != expert_size ||
+            it->second.offset > p.arena_bytes ||
+            it->second.req_bytes > p.arena_bytes - it->second.offset) {
+            LLAMA_LOG_ERROR("nexus-expert-stream: source block disappeared or changed before upload\n");
+            return llama_expert_fill_status::IO_ERROR;
+        }
+
+        // A partir de aquí la hebra programa una transferencia: cuenta para la
+        // quiescencia de las barreras hasta que regrese de set_async.
+        ++p.programming_fills;
+        guard.arm_programming();
+
+        if (p.fill_epoch == UINT64_MAX) {
+            p.enter_fail_stop(fail_reason::epoch_overflow);
+        }
+        const uint64_t next_epoch = p.fill_epoch + 1;
+        try {
+            p.l2_inflight.push_back({ key, next_epoch });
+        } catch (...) {
+            // No se modifico el bloque ni el epoch: el guard libera
+            // programming_fills y no queda ninguna transferencia anunciada.
+            return llama_expert_fill_status::OUT_OF_MEMORY;
+        }
+        p.fill_epoch = next_epoch;
+        it->second.inflight++;
+        it->second.last_fill_epoch = next_epoch;
+
+        lk.unlock();
+
+        void * src_ptr = static_cast<uint8_t *>(p.arena_base) + blk_offset;
+        try {
+            ggml_backend_tensor_set_async(backend, bank, src_ptr, slot_offset, expert_size);
+        } catch (...) {
+            // La interfaz C de GGML no debe recibir una excepción. El registro
+            // ya protege el bloque; conservarlo como pendiente permite que el
+            // teardown lo trate como no confirmado, en vez de reutilizar la arena.
+            p.fatal.store(true, std::memory_order_release);
+            return llama_expert_fill_status::IO_ERROR;
+        }
+        p.stats.upload_bytes.fetch_add(expert_size, std::memory_order_relaxed);
+        p.stats.uploads_programmed.fetch_add(1, std::memory_order_relaxed);
     }
 
     return llama_expert_fill_status::LOADED;
 }
 
+llama_expert_fill_status llama_expert_source::fill_expert(
+        ggml_backend_t backend,
+        ggml_tensor * bank,
+        int32_t il,
+        const ggml_tensor * w,
+        int32_t expert,
+        size_t slot_offset,
+        size_t expert_size) {
+    llama_expert_fill_status status = llama_expert_fill_status::IO_ERROR;
+    try {
+        status = fill_expert_impl(backend, bank, il, w, expert, slot_offset, expert_size);
+    } catch (...) {
+        // Nunca dejar que una excepción C++ atraviese el callback C del scheduler.
+        // Estado interno desconocido: politica terminal con notificaciones a
+        // todos los esperadores, no solo fatal.
+        std::lock_guard<std::mutex> lk(pimpl->l2_mutex);
+        pimpl->enter_terminal(fail_reason::rollback_failed);
+        status = llama_expert_fill_status::IO_ERROR;
+    }
+    pimpl->stats.fill_attempts.fetch_add(1, std::memory_order_relaxed);
+    if (status == llama_expert_fill_status::LOADED) {
+        pimpl->stats.fills.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        pimpl->stats.record(status);
+    }
+    return status;
+}
+
 void llama_expert_source::on_layer_synchronized(int32_t il) {
     auto & p = *pimpl;
-
-    // Desmarcar pins de L2 para capas anteriores o iguales a il
-    if (p.max_l2_pairs > 0) {
-        std::lock_guard<std::mutex> lock(p.l2_mutex);
-        for (auto & kv : p.l2_index) {
-            if (kv.second.pinned && kv.second.layer_id <= il) {
-                kv.second.pinned = false;
-            }
+    std::lock_guard<std::mutex> lk(p.l2_mutex);
+    for (auto & kv : p.l2_index) {
+        if (kv.second.pin_layers > 0 && kv.first.layer_id <= il) {
+            kv.second.pin_layers = 0;
         }
-    }
-
-    // Liberar stages utilizados en capas anteriores o iguales a il
-    {
-        std::lock_guard<std::mutex> lock(p.ring_mutex);
-        for (auto & slot : p.ring_slots) {
-            if (slot.busy && slot.layer_id <= il) {
-                slot.busy = false;
-                slot.layer_id = -1;
-            }
-        }
-        p.ring_cv.notify_all();
     }
 }
 
 void llama_expert_source::synchronize_all() {
-    auto & p = *pimpl;
-    p.synchronize_backend();
+    pimpl->synchronize_external();
+}
 
-    if (p.max_l2_pairs > 0) {
-        std::lock_guard<std::mutex> lock(p.l2_mutex);
-        for (auto & kv : p.l2_index) {
-            kv.second.pinned = false;
-        }
-    }
+void llama_expert_source::drain() {
+    pimpl->drain_for_teardown();
+}
 
-    {
-        std::lock_guard<std::mutex> lock(p.ring_mutex);
-        for (auto & slot : p.ring_slots) {
-            slot.busy = false;
-            slot.layer_id = -1;
-        }
-        p.ring_cv.notify_all();
-    }
+bool llama_expert_source::was_arena_quarantined() const {
+    return pimpl->arena_quarantined.load(std::memory_order_acquire);
+}
+
+void llama_expert_source::begin_sync() {
+    pimpl->begin_sync();
+}
+
+void llama_expert_source::end_sync() {
+    pimpl->end_sync();
 }
 
 const llama_expert_stats & llama_expert_source::get_stats() const {
     return pimpl->stats;
 }
 
-size_t llama_expert_source::get_l2_capacity_pairs() const {
-    return pimpl->max_l2_pairs;
+const llama_expert_arena_stats & llama_expert_source::get_arena_stats() const {
+    auto & p = *pimpl;
+    std::lock_guard<std::mutex> lk(p.l2_mutex);
+
+    p.arena_stats.arena_bytes.store(p.arena_bytes);
+    p.arena_stats.aligned_bytes.store(p.aligned_bytes);
+    p.arena_stats.slack_bytes.store(p.slack_bytes);
+    p.arena_stats.free_bytes.store(p.free_bytes);
+
+    size_t resident = 0, invalid = 0, pinned = 0, inflight = 0;
+    size_t bytes_l = 0;
+    for (const auto & kv : p.l2_index) {
+        const auto & b = kv.second;
+        if (b.content == llama_expert_content::RESIDENT) resident++;
+        if (b.content == llama_expert_content::LOADING)  { bytes_l += b.size; }
+        if (b.content == llama_expert_content::INVALID)  invalid++;
+        if (b.pin_layers > 0) pinned++;
+        if (b.inflight > 0)   inflight++;
+    }
+
+    p.arena_stats.blocks_live.store(p.l2_index.size());
+    p.arena_stats.blocks_resident.store(resident);
+    p.arena_stats.blocks_invalid.store(invalid);
+    p.arena_stats.blocks_pinned.store(pinned);
+    p.arena_stats.blocks_inflight.store(inflight);
+    p.arena_stats.bytes_loading.store(bytes_l);
+
+    size_t largest_hole = 0;
+    for (const auto & h : p.free_holes) {
+        largest_hole = std::max(largest_hole, h.second);
+    }
+    p.arena_stats.largest_free_hole.store(largest_hole);
+    p.arena_stats.align_a.store(p.alignment);
+
+    p.arena_stats.evictions.store(p.evictions);
+    p.arena_stats.evict_bytes.store(p.evict_bytes);
+    p.arena_stats.evict_slack_bytes.store(p.evict_slack_bytes);
+    p.arena_stats.sync_calls.store(p.sync_calls);
+    p.arena_stats.sync_failures.store(p.sync_failures);
+    p.arena_stats.alloc_fail.store(p.alloc_fail);
+    p.arena_stats.oom_rejects.store(p.oom_rejects);
+
+    return p.arena_stats;
 }
 
-size_t llama_expert_source::get_staging_ring_slots() const {
-    return pimpl->ring_slots.size();
+bool llama_expert_source::get_block_info(const llama_expert_key & key, llama_expert_block_info & out) const {
+    auto & p = *pimpl;
+    std::lock_guard<std::mutex> lk(p.l2_mutex);
+    auto it = p.l2_index.find(key);
+    if (it == p.l2_index.end()) {
+        return false;
+    }
+    const auto & b = it->second;
+    out.content     = b.content;
+    out.pin_layers  = b.pin_layers;
+    out.inflight    = b.inflight;
+    out.needs_proof = b.needs_proof;
+    out.lru_tick    = b.lru_tick;
+    out.offset      = b.offset;
+    out.size        = b.size;
+    out.slack       = b.slack;
+    out.mem_kind    = p.mem_kind;
+    return true;
+}
+
+size_t llama_expert_source::get_l2_capacity_pairs() const {
+    auto & p = *pimpl;
+    const size_t pair_sz = p.pair_bytes;
+    if (pair_sz == 0) {
+        // capacidad desconocida: no se inventa una estimacion
+        return 0;
+    }
+    return p.arena_bytes / pair_sz;
+}
+
+size_t llama_expert_source::get_l2_block_count() const {
+    std::lock_guard<std::mutex> lk(pimpl->l2_mutex);
+    return pimpl->l2_index.size();
+}
+
+size_t llama_expert_source::get_effective_alignment() const {
+    return pimpl->alignment;
+}
+
+size_t llama_expert_source::get_arena_bytes() const {
+    return pimpl->arena_bytes;
+}
+
+llama_expert_mem_kind llama_expert_source::get_l2_mem_kind() const {
+    return pimpl->mem_kind;
 }

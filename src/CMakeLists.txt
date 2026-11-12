@@ -78,3 +78,10 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+
+# Nexus test hooks: PUBLIC para que lib y test compartan la misma macro y la
+# misma implementacion bajo prueba. En la compilacion de produccion la opcion
+# esta OFF y no existe ningun hook en el codigo compilado.
+if (LLAMA_NEXUS_TEST_HOOKS)
+    target_compile_definitions(llama PUBLIC GGML_NEXUS_TEST_HOOKS)
+endif()
