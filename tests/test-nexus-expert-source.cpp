@@ -276,6 +276,169 @@ static void test_concurrency_and_barrier_quiescence() {
 }
 
 
+static void test_blocker_a_concurrent_same_key() {
+    printf("[TEST] Testing blocker A: concurrent loads of the same key...\n");
+
+    // 1. 2, 4 y 8 hilos pidiendo la MISMA clave (0, t, 0). Una unica lectura.
+    for (int n_threads : { 2, 4, 8 }) {
+        llama_expert_model_meta meta;
+        llama_expert_source::config cfg;
+        cfg.ram_warm_bytes = 4 * 1024 * 1024;
+        cfg.alignment      = 64;
+
+        char temp_path[] = "/tmp/test_nexus_a_XXXXXX";
+        int fd = mkstemp(temp_path);
+        TEST_CHECK(fd >= 0, "mkstemp failed");
+        const size_t file_size = 8 * 1024 * 1024;
+        TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+        meta.files.push_back({ temp_path, file_size });
+
+        ggml_tensor t{};
+        t.ne[2] = 8;
+        t.nb[2] = 1024 * 1024;
+        meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 8, true };
+
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create failed");
+
+        ggml_tensor dummy_bank{};
+
+        // Barrera: los hilos se alinean DENTRO de la seccion de consulta de la
+        // clave, cuando ya miraron el estado. Uno solo podra reclamarla.
+        std::atomic<int> reached{0};
+        std::atomic<bool> release{false};
+        std::atomic<int> loaded{0};
+        std::atomic<int> failed{0};
+        std::vector<std::thread> workers;
+        for (int i = 0; i < n_threads; ++i) {
+            workers.emplace_back([&, i]() {
+                reached.fetch_add(1, std::memory_order_release);
+                while (!release.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                const auto st = exsrc->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, 1024 * 1024);
+                if (st == llama_expert_fill_status::LOADED) {
+                    loaded.fetch_add(1, std::memory_order_release);
+                } else {
+                    failed.fetch_add(1, std::memory_order_release);
+                }
+            });
+        }
+        while (reached.load(std::memory_order_acquire) != n_threads) {
+            std::this_thread::yield();
+        }
+        // Dormir un instante para maximizar la probabilidad de que todos hayan
+        // observado el estado de la clave antes de que el primero la reclame.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        release.store(true, std::memory_order_release);
+        for (auto & w : workers) {
+            w.join();
+        }
+
+        TEST_CHECK(loaded.load() == n_threads && failed.load() == 0,
+                   "all waiters must observe the loader's RESIDENT block");
+        TEST_CHECK(exsrc->get_stats().l2_misses.load() == 1,
+                   "exactly one NVMe read per key is allowed");
+        TEST_CHECK(exsrc->get_stats().completed_reads.load() == 1,
+                   "completed reads must match the single miss");
+
+        // No quedan entradas LOADING ni bloques perdidos.
+        TEST_CHECK(exsrc->get_arena_stats().blocks_live.load() == 1,
+                   "exactly one block must remain");
+        TEST_CHECK(exsrc->get_arena_stats().blocks_resident.load() == 1,
+                   "the remaining block must be RESIDENT");
+        const auto & s = exsrc->get_arena_stats();
+        TEST_CHECK(s.aligned_bytes.load() + s.slack_bytes.load() + s.free_bytes.load() == s.arena_bytes.load(),
+                   "arena invariant violated");
+
+        exsrc->drain();
+        exsrc.reset();
+        close(fd);
+        unlink(temp_path);
+    }
+
+    // 2. Fallo de lectura: todos los solicitantes se despiertan y un nuevo
+    // intento posterior puede volver a cargar la clave.
+    {
+        llama_expert_model_meta meta;
+        llama_expert_source::config cfg;
+        cfg.ram_warm_bytes = 2 * 1024 * 1024;
+        cfg.alignment      = 64;
+
+        char temp_path[] = "/tmp/test_nexus_a_fail_XXXXXX";
+        int fd = mkstemp(temp_path);
+        TEST_CHECK(fd >= 0, "mkstemp failed");
+        const size_t file_size = 4 * 1024 * 1024;
+        TEST_CHECK(ftruncate(fd, file_size) == 0, "ftruncate failed");
+        meta.files.push_back({ temp_path, file_size });
+
+        ggml_tensor t{};
+        t.ne[2] = 8;
+        t.nb[2] = 1024 * 1024;
+        // Extent dentro del archivo pero se truncara debajo antes de la lectura.
+        meta.tensors[&t] = { 0, 0, 1024 * 1024, 1024 * 1024, 8, true };
+
+        auto exsrc = llama_expert_source::create(meta, cfg);
+        TEST_CHECK(exsrc != nullptr, "create failed");
+        ggml_tensor dummy_bank{};
+
+        std::atomic<int> reached{0};
+        std::atomic<bool> release{false};
+        std::atomic<int> io_errors{0};
+        std::vector<std::thread> workers;
+        for (int i = 0; i < 4; ++i) {
+            workers.emplace_back([&]() {
+                reached.fetch_add(1, std::memory_order_release);
+                while (!release.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                const auto st = exsrc->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, 1024 * 1024);
+                if (st == llama_expert_fill_status::IO_ERROR) {
+                    io_errors.fetch_add(1, std::memory_order_release);
+                }
+            });
+        }
+        while (reached.load(std::memory_order_acquire) != 4) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        TEST_CHECK(ftruncate(fd, 512 * 1024) == 0, "ftruncate failed");
+        release.store(true, std::memory_order_release);
+        for (auto & w : workers) {
+            w.join();
+        }
+        // Todos observaron el fallo (el que leyo y los que esperaban).
+        TEST_CHECK(io_errors.load() == 4, "every waiter must see the read failure");
+        TEST_CHECK(exsrc->get_stats().completed_reads.load() == 0,
+                   "a failed read must never count as completed");
+        TEST_CHECK(exsrc->get_arena_stats().blocks_live.load() == 0,
+                   "no block must survive a failed read");
+
+        // Cada hilo despertado reintenta la clave y, como el archivo sigue
+        // truncado, cada reintento es un miss que falla. No puede quedar una
+        // entrada LOADING tras todos los reintentos.
+        TEST_CHECK(exsrc->get_arena_stats().blocks_live.load() == 0,
+                   "no LOADING entry may survive after the notifications");
+
+        // Un nuevo intento posterior puede volver a cargar la clave.
+        TEST_CHECK(ftruncate(fd, 4 * 1024 * 1024) == 0, "ftruncate restore failed");
+        auto st = exsrc->fill_expert(nullptr, &dummy_bank, 0, &t, 0, 0, 1024 * 1024);
+        TEST_CHECK(st == llama_expert_fill_status::LOADED, "the key must be loadable again");
+        TEST_CHECK(exsrc->get_stats().completed_reads.load() == 1,
+                   "the retry must complete exactly one read");
+        TEST_CHECK(exsrc->get_arena_stats().blocks_resident.load() == 1,
+                   "the retry must leave a RESIDENT block");
+
+        exsrc->drain();
+        exsrc.reset();
+        close(fd);
+        unlink(temp_path);
+    }
+
+    printf("[PASS] Blocker A concurrent same-key loads passed.\n");
+}
+
+
 static void test_b1_b4_robustness_invariants() {
     printf("[TEST] Testing Bloques B1-B4 robustness invariants...\n");
 
@@ -1090,6 +1253,7 @@ int main() {
     test_l2_dimensioning_and_pinning();
     test_allocator_coalescing_and_fragmentation();
     test_concurrency_and_barrier_quiescence();
+    test_blocker_a_concurrent_same_key();
     test_b1_b4_robustness_invariants();
     test_two_phase_sync_and_teardown();
     test_b2_sync_modes_and_teardown();

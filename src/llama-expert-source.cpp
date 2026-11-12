@@ -1202,115 +1202,143 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
         return llama_expert_fill_status::NOT_SUPPORTED;
     }
 
-    llama_expert_key key { il, reinterpret_cast<uintptr_t>(w), expert };
+    // --- 1+2. Coordinación de carga (bloqueante A) ---
+    // La búsqueda, la reclamación de la clave y la inserción del bloque LOADING
+    // ocurren en una única sección crítica. Un segundo hilo solo puede observar
+    // RESIDENT o LOADING; si observa LOADING espera en cv_loading sin reclamar
+    // la clave, de modo que una clave tiene exactamente un cargador.
+    bool   is_loader   = false;
+    size_t blk_offset  = 0;
+    size_t alloc_off   = 0;
+    size_t alloc_sz    = 0;
+    size_t alloc_slk   = 0;
+    const llama_expert_key key { il, reinterpret_cast<uintptr_t>(w), expert };
 
-    // --- 1. Consulta L2 Cache & Coordinación LOADING (B2) ---
-    bool is_hit = false;
-    size_t blk_offset = 0;
-    {
+    for (;;) {
         std::unique_lock<std::mutex> lk(p.l2_mutex);
-        while (true) {
-            auto it = p.l2_index.find(key);
-            if (it != p.l2_index.end()) {
-                if (it->second.content == llama_expert_content::RESIDENT) {
-                    is_hit = true;
-                    p.stats.l2_hits++;
-                    nexus_l2_block & blk = it->second;
-                    blk.pin_layers++;
-                    blk.lru_tick = ++p.current_lru_tick;
-                    blk_offset = blk.offset;
-
-                    p.l2_lru_list.erase(blk.lru_it);
-                    p.l2_lru_list.push_front(key);
-                    blk.lru_it = p.l2_lru_list.begin();
-                    break;
-                } else if (it->second.content == llama_expert_content::LOADING) {
-                    // B2: Otro hilo está cargando esta clave. Esperar en cv_loading.
-                    p.cv_loading.wait(lk);
-                    if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
-                        return llama_expert_fill_status::IO_ERROR;
-                    }
-                    continue; // Re-evaluar estado tras el despertar
-                } else {
-                    // INVALID o estado anómalo
-                    return llama_expert_fill_status::IO_ERROR;
-                }
-            } else {
-                // Clave ausente en L2 -> requiere carga
-                break;
-            }
+        if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+            return llama_expert_fill_status::IO_ERROR;
         }
 
-    }
+        auto it = p.l2_index.find(key);
+        if (it != p.l2_index.end()) {
+            if (it->second.content == llama_expert_content::RESIDENT) {
+                p.stats.l2_hits++;
+                nexus_l2_block & blk = it->second;
+                blk.pin_layers++;
+                blk.lru_tick = ++p.current_lru_tick;
+                blk_offset = blk.offset;
 
-    // --- 2. Miss: Asignación y carga NVMe ---
-    if (!is_hit) {
-        p.stats.l2_misses++;
-        size_t alloc_off = 0;
-        size_t alloc_sz  = 0;
-        size_t alloc_slk = 0;
-
-        {
-            std::unique_lock<std::mutex> ul(p.l2_mutex);
-            while (!p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk)) {
-                if (!p.evict_lru_victim()) {
-                    ul.unlock();
-                    p.synchronize_active_fill();
-                    ul.lock();
-
-                    if (!p.evict_lru_victim()) {
-                        p.alloc_fail++;
-                        p.oom_rejects++;
-                        return llama_expert_fill_status::OUT_OF_MEMORY;
-                    }
-                }
-            }
-
-            // B3: el destino completo debe caber en la arena. El allocator no
-            // deberia entregar un rango fuera de ella; si lo hiciera, se
-            // devuelve el hueco y se rechaza el extent en vez de escribir fuera.
-            if (alloc_off > p.arena_bytes || alloc_sz > p.arena_bytes - alloc_off ||
-                expert_size > alloc_sz) {
-                p.free_block(alloc_off, alloc_sz, alloc_slk);
-                p.alloc_fail++;
-                return llama_expert_fill_status::INVALID_EXTENT;
-            }
-
-            nexus_l2_block blk;
-            blk.offset     = alloc_off;
-            blk.size       = alloc_sz;
-            blk.slack      = alloc_slk;
-            blk.req_bytes  = expert_size;
-            blk.content    = llama_expert_content::LOADING;
-            blk.pin_layers = 1;
-            blk.inflight   = 0;
-            blk.lru_tick   = ++p.current_lru_tick;
-
-            try {
+                p.l2_lru_list.erase(blk.lru_it);
                 p.l2_lru_list.push_front(key);
                 blk.lru_it = p.l2_lru_list.begin();
-                const auto inserted = p.l2_index.emplace(key, blk);
-                if (!inserted.second) {
-                    p.l2_lru_list.erase(blk.lru_it);
-                    p.free_block(alloc_off, alloc_sz, alloc_slk);
-                    return llama_expert_fill_status::IO_ERROR;
-                }
-            } catch (...) {
-                // El hueco y los contadores se restauran antes de propagar al
-                // wrapper C-safe; no queda una clave parcialmente publicada.
-                if (!p.l2_lru_list.empty() && p.l2_lru_list.front().layer_id == key.layer_id &&
-                    p.l2_lru_list.front().tensor_id == key.tensor_id &&
-                    p.l2_lru_list.front().expert_id == key.expert_id) {
-                    p.l2_lru_list.pop_front();
-                }
-                p.free_block(alloc_off, alloc_sz, alloc_slk);
-                return llama_expert_fill_status::OUT_OF_MEMORY;
+                break;
             }
-            blk_offset = alloc_off;
+            if (it->second.content == llama_expert_content::LOADING) {
+                // Otro hilo está cargando esta clave: esperar en cv_loading. No
+                // se reclama la clave ni se incrementan misses.
+                p.cv_loading.wait(lk, [&]{
+                    return p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed) ||
+                        p.l2_index.find(key) == p.l2_index.end() ||
+                        p.l2_index[key].content != llama_expert_content::LOADING;
+                });
+                continue;
+            }
+            // INVALID o estado anómalo
+            return llama_expert_fill_status::IO_ERROR;
         }
 
-        // Lectura desde NVMe fuera de l2_mutex. `shard` y `file_offset` ya se
-        // validaron antes de asignar el bloque.
+        // Clave ausente: solo este hilo puede reclamarla ahora (mutex tomado).
+        // Miss contabilizado bajo el mutex; nadie más cuenta esta clave.
+        p.stats.l2_misses++;
+        is_loader = true;
+
+        while (!p.alloc_block(expert_size, alloc_off, alloc_sz, alloc_slk)) {
+            if (!p.evict_lru_victim()) {
+                lk.unlock();
+                p.synchronize_active_fill();
+                lk.lock();
+
+                if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+                    return llama_expert_fill_status::IO_ERROR;
+                }
+                if (!p.evict_lru_victim()) {
+                    p.alloc_fail++;
+                    p.oom_rejects++;
+                    return llama_expert_fill_status::OUT_OF_MEMORY;
+                }
+            }
+        }
+
+        // B3: el destino completo debe caber en la arena. El allocator no
+        // deberia entregar un rango fuera de ella; si lo hiciera, se
+        // devuelve el hueco y se rechaza el extent en vez de escribir fuera.
+        if (alloc_off > p.arena_bytes || alloc_sz > p.arena_bytes - alloc_off ||
+            expert_size > alloc_sz) {
+            p.free_block(alloc_off, alloc_sz, alloc_slk);
+            p.alloc_fail++;
+            return llama_expert_fill_status::INVALID_EXTENT;
+        }
+
+        nexus_l2_block blk;
+        blk.offset     = alloc_off;
+        blk.size       = alloc_sz;
+        blk.slack      = alloc_slk;
+        blk.req_bytes  = expert_size;
+        blk.content    = llama_expert_content::LOADING;
+        blk.pin_layers = 1;
+        blk.inflight   = 0;
+        blk.lru_tick   = ++p.current_lru_tick;
+
+        try {
+            p.l2_lru_list.push_front(key);
+            blk.lru_it = p.l2_lru_list.begin();
+            const auto inserted = p.l2_index.emplace(key, blk);
+            if (!inserted.second) {
+                // Inalcanzable bajo el mismo mutex (la clave no existia al mirar),
+                // pero se mantiene como red de seguridad: restaurar y continuar.
+                p.l2_lru_list.erase(blk.lru_it);
+                p.free_block(alloc_off, alloc_sz, alloc_slk);
+                is_loader = false;
+                lk.unlock();
+                continue;
+            }
+        } catch (const std::bad_alloc &) {
+            // El hueco y los contadores se restauran antes de propagar al
+            // wrapper C-safe; no queda una clave parcialmente publicada.
+            if (!p.l2_lru_list.empty() && p.l2_lru_list.front().layer_id == key.layer_id &&
+                p.l2_lru_list.front().tensor_id == key.tensor_id &&
+                p.l2_lru_list.front().expert_id == key.expert_id) {
+                p.l2_lru_list.pop_front();
+            }
+            p.free_block(alloc_off, alloc_sz, alloc_slk);
+            return llama_expert_fill_status::OUT_OF_MEMORY;
+        } catch (...) {
+            // El hueco y los contadores se restauran antes de propagar al
+            // wrapper C-safe; no queda una clave parcialmente publicada.
+            if (!p.l2_lru_list.empty() && p.l2_lru_list.front().layer_id == key.layer_id &&
+                p.l2_lru_list.front().tensor_id == key.tensor_id &&
+                p.l2_lru_list.front().expert_id == key.expert_id) {
+                p.l2_lru_list.pop_front();
+            }
+            p.free_block(alloc_off, alloc_sz, alloc_slk);
+            return llama_expert_fill_status::OUT_OF_MEMORY;
+        }
+        blk_offset = alloc_off;
+        break;
+    }
+
+    // --- 3. Carga NVMe (solo el hilo que reclamo la clave) ---
+    if (is_loader) {
+        // Mientras el bloque existe (LOADING/RESIDENT), la arena no puede
+        // liberarse ni sustituirse. Un hilo que llegue a una barrera durante
+        // esta ventana se pone a la espera; nunca ve la arena sin dueño.
+        {
+            std::unique_lock<std::mutex> lk(p.l2_mutex);
+            if (p.teardown || p.aborted || p.fatal.load(std::memory_order_relaxed)) {
+                return llama_expert_fill_status::IO_ERROR;
+            }
+        }
         void * dst_ptr = static_cast<uint8_t *>(p.arena_base) + blk_offset;
 
         const auto t0 = std::chrono::steady_clock::now();
@@ -1319,14 +1347,16 @@ llama_expert_fill_status llama_expert_source::fill_expert_impl(
 
         if (n_read != (int64_t) expert_size) {
             LLAMA_LOG_ERROR("nexus-expert-stream: pread_full failed for %s exp %d\n", ggml_get_name(w), expert);
-            std::lock_guard<std::mutex> lk(p.l2_mutex);
-            auto it = p.l2_index.find(key);
-            if (it != p.l2_index.end()) {
-                p.free_block(it->second.offset, it->second.size, it->second.slack);
-                p.l2_lru_list.erase(it->second.lru_it);
-                p.l2_index.erase(it);
+            {
+                std::lock_guard<std::mutex> lk(p.l2_mutex);
+                auto it = p.l2_index.find(key);
+                if (it != p.l2_index.end()) {
+                    p.free_block(it->second.offset, it->second.size, it->second.slack);
+                    p.l2_lru_list.erase(it->second.lru_it);
+                    p.l2_index.erase(it);
+                }
+                p.cv_loading.notify_all(); // B2: Despertar cualquier hilo que esperaba
             }
-            p.cv_loading.notify_all(); // B2: Despertar cualquier hilo que esperaba
             return llama_expert_fill_status::IO_ERROR;
         }
 
