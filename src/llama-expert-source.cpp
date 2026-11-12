@@ -1139,6 +1139,15 @@ struct llama_expert_create_result llama_expert_source::create(
     p->arena_bytes = cfg.ram_warm_bytes;
     p->alignment   = cfg.alignment > 0 ? cfg.alignment : 64;
 
+    // Cota de cordura: una arena RAM por encima de 1 TiB o de tamano cero no
+    // puede ser una configuracion valida del cache. Se rechaza ANTES de llamar
+    // al allocator para no provocar un fallo de tamano en el propio malloc.
+    if (p->arena_bytes == 0 || p->arena_bytes > ((size_t) 1 << 40)) {
+        LLAMA_LOG_ERROR("nexus-expert-stream: unreasonable arena size requested: %zu\n", p->arena_bytes);
+        result.status = llama_expert_create_status::OUT_OF_MEMORY;
+        return result;
+    }
+
     // Inicializar reserva host independiente con posix_memalign
     constexpr size_t MAX_ALIGN = ((size_t) 1) << (std::numeric_limits<size_t>::digits - 1);
     if (p->alignment == 0 || (p->alignment & (p->alignment - 1)) != 0 ||
