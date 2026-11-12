@@ -2201,8 +2201,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     metadata_valid = false;
                 }
 
+                const bool dense_product_valid = t->ne[1] >= 0 && t->nb[1] > 0 &&
+                    (uint64_t) t->ne[1] <= UINT64_MAX / (uint64_t) t->nb[1];
+                if (!dense_product_valid) {
+                    metadata_valid = false;
+                }
                 const bool is_exp_dense = metadata_valid &&
-                    (t->nb[2] == (uint64_t) t->ne[1] * t->nb[1]);
+                    (t->nb[2] == (uint64_t) t->ne[1] * (uint64_t) t->nb[1]);
                 t_meta.validation = !metadata_valid ? llama_expert_tensor_validation::INVALID :
                     ((is_moe && is_row_dense && is_exp_dense) ? llama_expert_tensor_validation::VALID :
                                                                   llama_expert_tensor_validation::UNSUPPORTED);
